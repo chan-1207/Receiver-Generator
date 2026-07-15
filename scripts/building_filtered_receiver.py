@@ -159,7 +159,7 @@ def is_blocked_by_other_building(receiver_row, conflict_gdf, sindex):
 
 
 # =========================
-# 1. 버퍼 폴리곤 로드
+# 버퍼 폴리곤 로드
 # =========================
 if input_layer_name:
     buf = gpd.read_file(input_polygon_gpkg_path, layer=input_layer_name)
@@ -180,7 +180,7 @@ if missing:
     raise ValueError(f"버퍼 레이어에 필수 필드가 없습니다: {missing}")
 
 # =========================
-# 2. 데이터 정리
+# 데이터 정리
 # =========================
 buf = buf[buf.geometry.notnull()].copy()
 buf["geometry"] = buf.geometry.apply(clean_geom)
@@ -207,12 +207,12 @@ buf = buf.reset_index(drop=True)
 print("valid buffer count:", len(buf))
 
 # =========================
-# 3. 좌표 변환기
+# 좌표 변환기
 # =========================
 transformer = Transformer.from_crs(buf.crs, "EPSG:4326", always_xy=True)
 
 # =========================
-# 4. 수음점 후보 생성
+# 수음점 후보 생성
 # =========================
 records = []
 receiver_count = 0
