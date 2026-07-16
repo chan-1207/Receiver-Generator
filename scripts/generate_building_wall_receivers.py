@@ -11,7 +11,7 @@ import math
 # 설정값
 # =========================
 input_polygon_gpkg_path = "../receivers/building/building_cropped_buffer_10m_offset_1m.gpkg"
-output_cvs_path = "../receivers/building/building_cropped_filtered_receivers.csv"
+output_cvs_path = "../receivers/building/building_cropped_receivers_new_new.csv"
 
 input_layer_name = None  # None = 첫 번째 레이어 자동 선택
 
@@ -95,12 +95,34 @@ def interpolate_points_on_line(line: LineString, spacing: float):
     if length <= 0:
         return []
 
-    n = max(1, math.ceil(length / spacing))
+    if spacing <= 0:
+        raise ValueError("wall spacing must be greater than 0")
 
+    # 버퍼 폴리곤의 각 벽면을 단위 간격을 기준으로 균등하게 나누어 수음점 배치
+    # 폴리곤의 꼭지점에 수음점 배치
+    # 단위 간격보다 짧을 경우 꼭지점에만 배치
+    section_count = max(1, math.floor(length / spacing))
+    section_length = length / section_count
+
+    return [
+        line.interpolate(i * section_length)
+        for i in range(section_count)
+    ]
+
+
+def get_exterior_receiver_points(geom, spacing: float):
     points = []
-    for i in range(n):
-        d = (i + 0.5) * length / n
-        points.append(line.interpolate(d))
+    seen_xy = set()
+
+    for segment in get_exterior_segments(geom):
+        for point in interpolate_points_on_line(segment, spacing):
+            xy = (point.x, point.y)
+
+            if xy in seen_xy:
+                continue
+
+            seen_xy.add(xy)
+            points.append(point)
 
     return points
 
@@ -109,12 +131,23 @@ def make_vertical_heights(building_h):
     if building_h <= 0:
         return np.array([])
 
-    heights = np.arange(start_height_m, building_h, vertical_spacing_m)
+    if vertical_spacing_m <= 0:
+        raise ValueError("vertical spacing must be greater than 0")
 
-    if len(heights) == 0:
-        heights = np.array([building_h / 2.0])
+    # 건물 높이가 최하단 설정 높이 이하이면 최상단에만 수음점을 배치한다.
+    if building_h <= start_height_m:
+        return np.array([building_h])
 
-    return heights
+    # 최하단 설정 높이부터 건물 최상단까지의 높이 차를 기준 간격으로 나눈다.
+    # 나눈 구간의 길이가 모두 같도록 배치하며, 최하단과 최상단을 모두 포함한다.
+    vertical_length = building_h - start_height_m
+    section_count = max(1, math.floor(vertical_length / vertical_spacing_m))
+
+    return np.linspace(
+        start_height_m,
+        building_h,
+        section_count + 1
+    )
 
 
 def is_blocked_by_other_building(receiver_row, conflict_gdf, sindex):
@@ -235,29 +268,26 @@ for idx, row in buf.iterrows():
         continue
 
     # 이미 만들어둔 버퍼 폴리곤 외곽선 기준
-    segments = get_exterior_segments(geom)
+    wall_points = get_exterior_receiver_points(geom, wall_spacing_m)
 
-    for seg_idx, seg in enumerate(segments):
-        wall_points = interpolate_points_on_line(seg, wall_spacing_m)
+    for pt in wall_points:
+        x, y = pt.x, pt.y
+        lon, lat = transformer.transform(x, y)
 
-        for pt_idx, pt in enumerate(wall_points):
-            x, y = pt.x, pt.y
-            lon, lat = transformer.transform(x, y)
+        for h in heights:
+            alt = base + float(h)
 
-            for h in heights:
-                alt = base + float(h)
+            receiver_count += 1
 
-                receiver_count += 1
-
-                records.append({
-                    "reference": reference,
-                    "x_epsg5179": x,
-                    "y_epsg5179": y,
-                    "lat": lat,
-                    "lon": lon,
-                    "alt": alt,
-                    "geometry": Point(x, y)
-                })
+            records.append({
+                "reference": reference,
+                "x_epsg5179": x,
+                "y_epsg5179": y,
+                "lat": lat,
+                "lon": lon,
+                "alt": alt,
+                "geometry": Point(x, y)
+            })
 
 receivers = gpd.GeoDataFrame(records, geometry="geometry", crs=buf.crs)
 

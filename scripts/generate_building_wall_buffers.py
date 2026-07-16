@@ -1,5 +1,6 @@
 import os
 import geopandas as gpd
+import pandas as pd
 from shapely.geometry import Polygon, MultiPolygon
 from shapely.validation import make_valid
 
@@ -18,13 +19,15 @@ keep_cols = [
     "NF_ID",
     "BLDH_MN",
     "BLDH_BV",
+    "Shape_Area",
 ]
 
 dilation = 10.0             # 큰 버퍼 후 되돌리기 거리 [m]
 simplify_m = 1.0            # 단순화 허용 오차 [m]
 receiver_offset_m = 1.0     # 최종 수음점용 외곽 버퍼 [m]
 
-min_area_m2 = 10.0          # 너무 작은 조각 제거 기준 [m2]
+area_col = "Shape_Area"
+min_area_m2 = 25.0          # 모폴로지 연산 전 건물 면적 필터 기준 [m2]
 
 
 # =========================
@@ -45,27 +48,6 @@ def count_vertices(geom):
         return sum(count_vertices(g) for g in geom.geoms)
 
     return 0
-
-
-def remove_small_parts(geom, min_area):
-    """Polygon/MultiPolygon에서 너무 작은 조각 제거"""
-    if geom is None or geom.is_empty:
-        return None
-
-    if isinstance(geom, Polygon):
-        return geom if geom.area >= min_area else None
-
-    if isinstance(geom, MultiPolygon):
-        parts = [g for g in geom.geoms if g.area >= min_area]
-
-        if len(parts) == 0:
-            return None
-        if len(parts) == 1:
-            return parts[0]
-
-        return MultiPolygon(parts)
-
-    return None
 
 
 def to_multipolygon(geom):
@@ -89,10 +71,9 @@ def simplify_building_polygon(geom):
     처리 순서:
     1) make_valid
     2) morphological closing: buffer(+dilation) -> buffer(-dilation)
-    3) 작은 조각 제거
-    4) simplify
-    5) receiver_offset_m 만큼 외곽 버퍼
-    6) MultiPolygon으로 통일
+    3) simplify
+    4) receiver_offset_m 만큼 외곽 버퍼
+    5) MultiPolygon으로 통일
     """
     if geom is None or geom.is_empty:
         return None
@@ -111,12 +92,6 @@ def simplify_building_polygon(geom):
     if geom is None or geom.is_empty:
         return None
 
-    # 너무 작은 조각 제거
-    geom = remove_small_parts(geom, min_area_m2)
-
-    if geom is None or geom.is_empty:
-        return None
-
     # 꼭짓점 단순화
     geom = geom.simplify(simplify_m, preserve_topology=True)
 
@@ -130,12 +105,6 @@ def simplify_building_polygon(geom):
         return None
 
     geom = make_valid(geom)
-
-    if geom is None or geom.is_empty:
-        return None
-
-    # 버퍼 후 다시 작은 조각 제거
-    geom = remove_small_parts(geom, min_area_m2)
 
     if geom is None or geom.is_empty:
         return None
@@ -172,11 +141,25 @@ if missing_cols:
 # 필요한 필드만 유지
 gdf = gdf[keep_cols + ["geometry"]].copy()
 
+# 건물 데이터에 명시된 면적을 기준으로 작은 건물을 먼저 제거한다.
+gdf[area_col] = pd.to_numeric(gdf[area_col], errors="coerce")
+input_row_count = len(gdf)
+gdf = gdf[
+    gdf[area_col].notna()
+    & (gdf[area_col] >= min_area_m2)
+].copy()
+
+print("[2] 건물 면적 사전 필터")
+print(" - area column:", area_col)
+print(" - minimum area [m2]:", min_area_m2)
+print(" - removed rows:", input_row_count - len(gdf))
+print(" - remaining rows:", len(gdf))
+
 # 원본 통계
 gdf["orig_vertex_count"] = gdf.geometry.apply(count_vertices)
 gdf["orig_area_m2"] = gdf.geometry.area
 
-print("[2] 버퍼/단순화 처리 시작")
+print("[3] 버퍼/단순화 처리 시작")
 gdf["geometry"] = gdf.geometry.apply(simplify_building_polygon)
 
 # 유효 geometry만 유지
@@ -213,7 +196,7 @@ gdf.to_file(
     layer=output_layer_name
 )
 
-print("[3] 저장 완료")
+print("[4] 저장 완료")
 print(" - output:", output_gpkg_path)
 print(" - layer:", output_layer_name)
 print(" - rows:", len(gdf))
