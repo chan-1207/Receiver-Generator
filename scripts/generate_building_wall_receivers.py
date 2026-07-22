@@ -22,7 +22,7 @@ top_col = "BLDH_BV"    # 건물 기본/지붕 절대고도
 wall_spacing_m = 10.0
 vertical_spacing_m = 10.0
 start_height_m = 1.5
-min_building_height_m = 2.0
+min_building_height_m = 1.5
 
 z_tolerance_m = 0.05
 
