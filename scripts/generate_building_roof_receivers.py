@@ -15,62 +15,30 @@ from shapely.validation import make_valid
 # 설정값
 # =========================
 input_building_gpkg_path = "../data/building_height/building_cropped_height.gpkg"
-output_directory = "../receivers/building/roof_receiver_cases"
-summary_csv_path = os.path.join(
-    output_directory,
-    "building_cropped_roof_receivers_case_summary.csv"
-)
+output_csv_path = "../receivers/building/cropped_building_roof_receivers.csv"
 
 input_layer_name = "TN_BULD"
 
 id_col = "NF_ID"
-base_col = "BLDH_MN"
 top_col = "BLDH_BV"
 area_col = "Shape_Area"
 
 min_building_area_m2 = 25.0
-min_building_height_m = 2.0
 
-roof_inset_m = 5.0
-roof_spacing_m = 10.0
+roof_resolution_m = 10.0
+roof_inset_m = roof_resolution_m / 2
 roof_height_offset_m = 1.0
 
-decomposition_cases = [
-    {
-        "name": "nosplit",
-        "enabled": False,
-        "rectangularity_threshold": None,
-        "max_split_depth": 0,
-        "min_piece_area_m2": None,
-    },
-    {
-        "name": "rect075_depth3_min25",
-        "enabled": True,
-        "rectangularity_threshold": 0.75,
-        "max_split_depth": 3,
-        "min_piece_area_m2": 25.0,
-    },
-    {
-        "name": "rect082_depth5_min15",
-        "enabled": True,
-        "rectangularity_threshold": 0.82,
-        "max_split_depth": 5,
-        "min_piece_area_m2": 15.0,
-    },
-    {
-        "name": "rect090_depth7_min10",
-        "enabled": True,
-        "rectangularity_threshold": 0.90,
-        "max_split_depth": 7,
-        "min_piece_area_m2": 10.0,
-    },
-]
+rectangularity_threshold = 0.8
+max_split_depth = 5
+min_piece_area_m2 = 15.0
 
 
 # =========================
 # 보조 함수
 # =========================
 def clean_geom(geom):
+    """도형 유효성 보정 및 빈 도형 제거"""
     if geom is None or geom.is_empty:
         return None
 
@@ -83,6 +51,7 @@ def clean_geom(geom):
 
 
 def polygon_parts(geom):
+    """Polygon 조각 추출"""
     if geom is None or geom.is_empty:
         return []
 
@@ -104,6 +73,7 @@ def polygon_parts(geom):
 
 
 def get_rectangle_edges(poly):
+    """최소 회전 사각형의 변 반환"""
     rectangle = poly.minimum_rotated_rectangle
     rectangle_coords = list(rectangle.exterior.coords)
 
@@ -114,6 +84,7 @@ def get_rectangle_edges(poly):
 
 
 def get_rectangularity(poly):
+    """폴리곤과 최소 회전 사각형의 면적 비율 계산"""
     rectangle = poly.minimum_rotated_rectangle
 
     if rectangle.is_empty or rectangle.area <= 0:
@@ -123,6 +94,7 @@ def get_rectangularity(poly):
 
 
 def get_concave_vertices(poly):
+    """폴리곤의 오목 꼭짓점 탐색"""
     coords = list(poly.exterior.coords)[:-1]
 
     if len(coords) < 4:
@@ -147,6 +119,7 @@ def get_concave_vertices(poly):
 
 
 def split_polygon_once(poly, min_piece_area_m2):
+    """직사각형도를 개선하는 1회 분할 탐색"""
     rectangle = poly.minimum_rotated_rectangle
     edges = get_rectangle_edges(poly)
     start, end = max(edges, key=lambda edge: LineString(edge).length)
@@ -253,6 +226,7 @@ def decompose_polygon(
     min_piece_area_m2,
     current_depth=0
 ):
+    """직사각형도와 최대 깊이 기준 재귀 분할"""
     if (
         current_depth >= max_split_depth
         or get_rectangularity(poly) >= rectangularity_threshold
@@ -280,21 +254,18 @@ def decompose_polygon(
     return result
 
 
-def decompose_geometry(geom, case):
+def decompose_geometry(geom):
+    """도형의 Polygon 조각 분할"""
     original_parts = polygon_parts(geom)
-
-    if not case["enabled"]:
-        return original_parts
-
     pieces = []
 
     for poly in original_parts:
         pieces.extend(
             decompose_polygon(
                 poly,
-                case["rectangularity_threshold"],
-                case["max_split_depth"],
-                case["min_piece_area_m2"]
+                rectangularity_threshold,
+                max_split_depth,
+                min_piece_area_m2
             )
         )
 
@@ -302,6 +273,7 @@ def decompose_geometry(geom, case):
 
 
 def get_geometric_center(geom):
+    """도형 내부 중심점 반환"""
     # 기하학적 중심이 폴리곤 내부에 있으면 그대로 사용한다.
     center = geom.centroid
 
@@ -324,23 +296,25 @@ def get_geometric_center(geom):
     return largest_part.representative_point()
 
 
-def get_centered_axis_values(min_value, max_value, spacing):
+def get_centered_axis_values(min_value, max_value, resolution):
+    """범위 중심 기준 등간격 좌표 생성"""
     center = (min_value + max_value) / 2.0
     half_length = (max_value - min_value) / 2.0
-    step_count = math.floor(half_length / spacing)
+    step_count = math.floor(half_length / resolution)
 
     # 사각형 중심을 기준으로 양쪽에 정확한 간격으로 후보점을 배치한다.
-    offsets = np.arange(-step_count, step_count + 1) * spacing
+    offsets = np.arange(-step_count, step_count + 1) * resolution
 
     return center + offsets
 
 
-def make_oriented_grid_candidates(poly, spacing):
+def make_oriented_grid_candidates(poly, resolution):
+    """폴리곤 주 방향 격자 후보점 생성"""
     if poly is None or poly.is_empty:
         return []
 
-    if spacing <= 0:
-        raise ValueError("지붕 격자 간격은 0보다 커야 합니다.")
+    if resolution <= 0:
+        raise ValueError("지붕 격자 해상도는 0보다 커야 합니다.")
 
     # 원본 건물을 감싸는 최소 면적 회전 사각형을 만든다.
     rectangle = poly.minimum_rotated_rectangle
@@ -364,8 +338,8 @@ def make_oriented_grid_candidates(poly, spacing):
         return [get_geometric_center(poly)]
 
     # 사각형 중심을 기준으로 정확히 10m 간격의 격자 후보를 만든다.
-    x_values = get_centered_axis_values(min_x, max_x, spacing)
-    y_values = get_centered_axis_values(min_y, max_y, spacing)
+    x_values = get_centered_axis_values(min_x, max_x, resolution)
+    y_values = get_centered_axis_values(min_y, max_y, resolution)
 
     candidates = []
 
@@ -384,13 +358,14 @@ def make_oriented_grid_candidates(poly, spacing):
     return candidates
 
 
-def make_roof_receiver_points(geom, case):
+def make_roof_receiver_points(geom):
+    """지붕 안전영역 내 수음점 생성"""
     if geom is None or geom.is_empty:
         return [], "empty", 0
 
-    pieces = decompose_geometry(geom, case)
+    pieces = decompose_geometry(geom)
 
-    # 외벽 수음점과 거리를 두기 위해 원본 건물 폴리곤을 5m 안쪽으로 줄인다.
+    # 외벽 수음점과 거리를 두기 위해 해상도의 절반만큼 안쪽으로 줄인다.
     roof_geom = clean_geom(
         geom.buffer(-roof_inset_m, join_style="mitre")
     )
@@ -412,11 +387,11 @@ def make_roof_receiver_points(geom, case):
         safe_piece_with_tolerance = safe_piece.buffer(1e-8)
         candidates = make_oriented_grid_candidates(
             poly,
-            roof_spacing_m
+            roof_resolution_m
         )
         piece_points = []
 
-        # 현재 조각의 -5m 안전 영역에 포함되는 후보점만 유지한다.
+        # 현재 조각의 축소 안전 영역에 포함되는 후보점만 유지한다.
         for point in candidates:
             if not safe_piece_with_tolerance.covers(point):
                 continue
@@ -440,7 +415,7 @@ def make_roof_receiver_points(geom, case):
     if len(points) == 0:
         return [get_geometric_center(roof_geom)], "center", len(pieces)
 
-    # 최종 수음점이 하나뿐이면 -5m 처리 형상에 치우치지 않도록
+    # 최종 수음점이 하나뿐이면 축소 형상에 치우치지 않도록
     # 원본 건물 폴리곤의 기하학적 중심으로 다시 배치한다.
     if len(points) == 1:
         return [get_geometric_center(geom)], "center", len(pieces)
@@ -451,6 +426,7 @@ def make_roof_receiver_points(geom, case):
 
 
 def load_buildings():
+    """입력 건물 데이터 로드 및 필터링"""
     if input_layer_name:
         buildings = gpd.read_file(
             input_building_gpkg_path,
@@ -465,7 +441,7 @@ def load_buildings():
     if buildings.crs.is_geographic:
         raise ValueError("미터 단위의 투영 좌표계를 사용해야 합니다.")
 
-    required_cols = [id_col, base_col, top_col, area_col]
+    required_cols = [id_col, top_col, area_col]
     missing_cols = [
         col for col in required_cols
         if col not in buildings.columns
@@ -481,10 +457,6 @@ def load_buildings():
     buildings = buildings[buildings.geometry.notnull()].copy()
     buildings = buildings[~buildings.geometry.is_empty].copy()
 
-    buildings[base_col] = pd.to_numeric(
-        buildings[base_col],
-        errors="coerce"
-    )
     buildings[top_col] = pd.to_numeric(
         buildings[top_col],
         errors="coerce"
@@ -496,23 +468,18 @@ def load_buildings():
 
     buildings = buildings[
         buildings[id_col].notna()
-        & buildings[base_col].notna()
         & buildings[top_col].notna()
         & buildings[area_col].notna()
         & (buildings[area_col] >= min_building_area_m2)
     ].copy()
 
-    buildings["building_height"] = (
-        buildings[top_col] - buildings[base_col]
-    )
-    buildings = buildings[
-        buildings["building_height"] >= min_building_height_m
-    ].reset_index(drop=True)
+    buildings = buildings.reset_index(drop=True)
 
     return buildings
 
 
-def generate_case(buildings, transformer, case):
+def generate_receivers(buildings, transformer):
+    """전체 지붕 수음점 생성 및 CSV 저장"""
     records = []
     center_building_count = 0
     grid_building_count = 0
@@ -522,8 +489,7 @@ def generate_case(buildings, transformer, case):
     for _, row in buildings.iterrows():
         original_part_count = len(polygon_parts(row.geometry))
         points, placement_type, piece_count = make_roof_receiver_points(
-            row.geometry,
-            case
+            row.geometry
         )
         total_piece_count += piece_count
 
@@ -554,10 +520,6 @@ def generate_case(buildings, transformer, case):
     if len(records) == 0:
         raise ValueError("생성된 지붕 수음점이 없습니다.")
 
-    output_csv_path = os.path.join(
-        output_directory,
-        f"building_cropped_roof_receivers_{case['name']}.csv"
-    )
     output_cols = [
         "reference",
         "x_epsg5179",
@@ -585,23 +547,8 @@ def generate_case(buildings, transformer, case):
     print("roof receiver count:", len(output_df))
     print("saved:", output_csv_path)
 
-    return {
-        "case": case["name"],
-        "rectangularity_threshold": case["rectangularity_threshold"],
-        "max_split_depth": case["max_split_depth"],
-        "min_piece_area_m2": case["min_piece_area_m2"],
-        "valid_building_count": len(buildings),
-        "center_building_count": center_building_count,
-        "grid_building_count": grid_building_count,
-        "split_building_count": split_building_count,
-        "total_polygon_piece_count": total_piece_count,
-        "roof_receiver_count": len(output_df),
-        "output_csv": output_csv_path,
-    }
-
-
 def main():
-    os.makedirs(output_directory, exist_ok=True)
+    os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
 
     buildings = load_buildings()
     transformer = Transformer.from_crs(
@@ -609,24 +556,7 @@ def main():
         "EPSG:4326",
         always_xy=True
     )
-    summaries = []
-
-    for case in decomposition_cases:
-        print()
-        print("=" * 60)
-        print("case:", case["name"])
-        summaries.append(
-            generate_case(buildings, transformer, case)
-        )
-
-    summary_df = pd.DataFrame(summaries)
-    summary_df.to_csv(
-        summary_csv_path,
-        index=False,
-        encoding="utf-8-sig"
-    )
-    print()
-    print("case summary saved:", summary_csv_path)
+    generate_receivers(buildings, transformer)
 
 
 if __name__ == "__main__":

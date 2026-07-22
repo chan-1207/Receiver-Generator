@@ -5,13 +5,12 @@ import numpy as np
 from shapely.geometry import LineString, Point
 from shapely.validation import make_valid
 from pyproj import Transformer
-import math
 
 # =========================
 # 설정값
 # =========================
-input_polygon_gpkg_path = "../receivers/building/building_cropped_buffer_10m_offset_1m.gpkg"
-output_cvs_path = "../receivers/building/building_cropped_receivers_new_new.csv"
+input_polygon_gpkg_path = "../receivers/building/cropped_building_buffers_10m.gpkg"
+output_cvs_path = "../receivers/building/cropped_building_receivers_new.csv"
 
 input_layer_name = None  # None = 첫 번째 레이어 자동 선택
 
@@ -19,23 +18,14 @@ id_col = "NF_ID"
 base_col = "BLDH_MN"   # 건물 지반 절대고도
 top_col = "BLDH_BV"    # 건물 기본/지붕 절대고도
 
-wall_spacing_m = 10.0
-vertical_spacing_m = 10.0
+wall_resolution_m = 10.0
+vertical_resolution_m = 10.0
 start_height_m = 1.5
 min_building_height_m = 1.5
 
 z_tolerance_m = 0.05
 
-save_debug_all_receivers = False
-debug_csv = "outputs/BLD010000003AE81A_receivers_debug_all.csv"
-
-# =========================
-# 출력 폴더 생성
-# =========================
 os.makedirs(os.path.dirname(output_cvs_path), exist_ok=True)
-
-if save_debug_all_receivers:
-    os.makedirs(os.path.dirname(debug_csv), exist_ok=True)
 
 # =========================
 # 보조 함수
@@ -89,19 +79,34 @@ def get_exterior_segments(geom):
     return segments
 
 
-def interpolate_points_on_line(line: LineString, spacing: float):
+def get_section_count(length: float, resolution: float):
+    # 남는 길이가 단위 간격의 절반 이하면 버리고, 초과하면 구간을 하나 추가
+    if resolution <= 0:
+        raise ValueError("resolution must be greater than 0")
+
+    full_section_count, remainder = divmod(length, resolution)
+    section_count = int(full_section_count)
+
+    if remainder > resolution / 2:
+        section_count += 1
+
+    return max(1, section_count)
+
+
+def interpolate_points_on_line(line: LineString, resolution: float):
     length = line.length
 
     if length <= 0:
         return []
 
-    if spacing <= 0:
-        raise ValueError("wall spacing must be greater than 0")
+    if resolution <= 0:
+        raise ValueError("wall resolution must be greater than 0")
 
     # 버퍼 폴리곤의 각 벽면을 단위 간격을 기준으로 균등하게 나누어 수음점 배치
     # 폴리곤의 꼭지점에 수음점 배치
-    # 단위 간격보다 짧을 경우 꼭지점에만 배치
-    section_count = max(1, math.floor(length / spacing))
+    # 남는 길이가 단위 간격의 절반 이하면 버리고, 초과하면 구간을 하나 추가
+    # 단위 간격보다 짧을 경우에는 최소 한 구간을 사용
+    section_count = get_section_count(length, resolution)
     section_length = length / section_count
 
     return [
@@ -110,12 +115,12 @@ def interpolate_points_on_line(line: LineString, spacing: float):
     ]
 
 
-def get_exterior_receiver_points(geom, spacing: float):
+def get_exterior_receiver_points(geom, resolution: float):
     points = []
     seen_xy = set()
 
     for segment in get_exterior_segments(geom):
-        for point in interpolate_points_on_line(segment, spacing):
+        for point in interpolate_points_on_line(segment, resolution):
             xy = (point.x, point.y)
 
             if xy in seen_xy:
@@ -131,17 +136,17 @@ def make_vertical_heights(building_h):
     if building_h <= 0:
         return np.array([])
 
-    if vertical_spacing_m <= 0:
-        raise ValueError("vertical spacing must be greater than 0")
+    if vertical_resolution_m <= 0:
+        raise ValueError("vertical resolution must be greater than 0")
 
-    # 건물 높이가 최하단 설정 높이 이하이면 최상단에만 수음점을 배치한다.
+    # 건물 높이가 최하단 설정 높이 이하이면 최상단에만 수음점을 배치
     if building_h <= start_height_m:
         return np.array([building_h])
 
     # 최하단 설정 높이부터 건물 최상단까지의 높이 차를 기준 간격으로 나눈다.
-    # 나눈 구간의 길이가 모두 같도록 배치하며, 최하단과 최상단을 모두 포함한다.
+    # 나눈 구간의 길이가 모두 같도록 배치하며, 최하단과 최상단을 모두 포함
     vertical_length = building_h - start_height_m
-    section_count = max(1, math.floor(vertical_length / vertical_spacing_m))
+    section_count = get_section_count(vertical_length, vertical_resolution_m)
 
     return np.linspace(
         start_height_m,
@@ -154,9 +159,9 @@ def is_blocked_by_other_building(receiver_row, conflict_gdf, sindex):
     """
     삭제 조건:
     1. 수음점 XY가 다른 건물의 버퍼 폴리곤 안/경계에 있음
-    2. 수음점 alt가 상대 건물 top_alt 이하임
+    2. 수음점 alt가 상대 건물 top_alt 이하
 
-    높은 건물의 상부 수음점은 유지됨.
+    높은 건물의 상부 수음점은 유지
     """
     p = receiver_row.geometry
     my_id = receiver_row["reference"]
@@ -268,7 +273,7 @@ for idx, row in buf.iterrows():
         continue
 
     # 이미 만들어둔 버퍼 폴리곤 외곽선 기준
-    wall_points = get_exterior_receiver_points(geom, wall_spacing_m)
+    wall_points = get_exterior_receiver_points(geom, wall_resolution_m)
 
     for pt in wall_points:
         x, y = pt.x, pt.y
@@ -297,7 +302,7 @@ if len(receivers) == 0:
     raise ValueError("생성된 수음점이 없습니다. 버퍼 폴리곤과 높이 필드를 확인하세요.")
 
 # =========================
-# 5. 3D 높이 기반 겹침 필터링
+# 3D 높이 기반 겹침 필터링
 # =========================
 # 같은 버퍼 레이어를 충돌 판단용으로 사용
 conflict_gdf = buf[[id_col, top_col, "geometry"]].copy()
@@ -318,11 +323,6 @@ print("final receivers count:", len(filtered))
 # =========================
 # CSV 저장
 # =========================
-if save_debug_all_receivers:
-    debug_df = receivers.drop(columns="geometry").copy()
-    debug_df.to_csv(debug_csv, index=False, encoding="utf-8-sig")
-    print(f"debug saved: {debug_csv}")
-
 output_cols = [
     "reference",
     "x_epsg5179",
