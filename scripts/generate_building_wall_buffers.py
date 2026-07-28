@@ -7,8 +7,8 @@ from shapely.validation import make_valid
 # =========================
 # 설정값
 # =========================
-input_building_height_path = "../data/building_height/building_cropped_height.gpkg"
-output_gpkg_path = "../receivers/building/building_cropped_buffer_10m_offset_1m.gpkg"
+input_building_height_path = "../data/building_height/building_height.gpkg"
+output_gpkg_path = "../receivers/building/building_simplyfied.gpkg"
 
 input_layer_name = "TN_BULD"      # None = 첫 번째 레이어 자동 선택
 output_layer_name = "building_buffer"

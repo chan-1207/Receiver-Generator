@@ -23,6 +23,11 @@ vertical_resolution_m = 10.0
 start_height_m = 1.5
 min_building_height_m = 1.5
 
+min_x = 1163000
+max_x = 1164000
+min_y = 1732000
+max_y = 1733000
+
 z_tolerance_m = 0.05
 
 os.makedirs(os.path.dirname(output_cvs_path), exist_ok=True)
@@ -105,7 +110,6 @@ def interpolate_points_on_line(line: LineString, resolution: float):
     # 버퍼 폴리곤의 각 벽면을 단위 간격을 기준으로 균등하게 나누어 수음점 배치
     # 폴리곤의 꼭지점에 수음점 배치
     # 남는 길이가 단위 간격의 절반 이하면 버리고, 초과하면 구간을 하나 추가
-    # 단위 간격보다 짧을 경우에는 최소 한 구간을 사용
     section_count = get_section_count(length, resolution)
     section_length = length / section_count
 
@@ -254,6 +258,7 @@ transformer = Transformer.from_crs(buf.crs, "EPSG:4326", always_xy=True)
 # =========================
 records = []
 receiver_count = 0
+outside_xy_count = 0
 
 for idx, row in buf.iterrows():
     geom = row.geometry
@@ -277,6 +282,12 @@ for idx, row in buf.iterrows():
 
     for pt in wall_points:
         x, y = pt.x, pt.y
+
+        # 대상지역 외부 XY 후보 제외
+        if not (min_x <= x <= max_x and min_y <= y <= max_y):
+            outside_xy_count += 1
+            continue
+
         lon, lat = transformer.transform(x, y)
 
         for h in heights:
@@ -297,6 +308,7 @@ for idx, row in buf.iterrows():
 receivers = gpd.GeoDataFrame(records, geometry="geometry", crs=buf.crs)
 
 print("candidate receivers count:", len(receivers))
+print("outside XY candidate count:", outside_xy_count)
 
 if len(receivers) == 0:
     raise ValueError("생성된 수음점이 없습니다. 버퍼 폴리곤과 높이 필드를 확인하세요.")

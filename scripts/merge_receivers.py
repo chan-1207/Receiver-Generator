@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 import geopandas as gpd
 
@@ -7,20 +8,24 @@ from shapely.geometry import Point
 # =========================
 # 설정값
 # =========================
-terrain_receiver_csv_path = "../receivers/terrain/terrain_receivers.csv"
-building_receiver_csv_path = "../receivers/building/building_cropped_filtered_receiver_.csv"
-building_buffer_gpkg_path = "../receivers/building/building_cropped_buffer_10m_offset_1m.gpkg"
+terrain_receiver_csv_path = "../receivers/terrain/cropped_terrain_receivers_center.csv"
+building_receiver_csv_path = "../receivers/building/cropped_building_receivers_new.csv"
+roof_receiver_csv_path = "../receivers/building/cropped_building_roof_receivers.csv"
+building_buffer_gpkg_path = "../receivers/building/cropped_building_buffers_10m.gpkg"
 
-output_csv_path = "../receivers/merged_receivers.csv"
+output_csv_path = "../receivers/cropped_merged_receivers_center.csv"
 
 buffer_layer_name = None
 
 crs_epsg = "EPSG:5179"
 
 big_grid_m = 100
+receiver_grid_m = 10
 
 min_x = 1163000
+max_x = 1164000
 min_y = 1732000
+max_y = 1733000
 
 
 # =========================
@@ -63,6 +68,27 @@ def read_receiver_csv(csv_path, receiver_type):
     return df
 
 
+def validate_receiver_bounds(df, receiver_type):
+    outside = (
+        (df["x_epsg5179"] < min_x)
+        | (df["x_epsg5179"] > max_x)
+        | (df["y_epsg5179"] < min_y)
+        | (df["y_epsg5179"] > max_y)
+    )
+    outside_count = int(outside.sum())
+    if outside_count == 0:
+        return
+
+    examples = df.loc[
+        outside,
+        ["x_epsg5179", "y_epsg5179"],
+    ].head(5)
+    raise ValueError(
+        f"{receiver_type} 대상지역 외부 수음점: {outside_count}개\n"
+        f"{examples.to_string(index=False)}"
+    )
+
+
 # =========================
 # GeoDataFrame 변환 함수
 # =========================
@@ -102,8 +128,7 @@ def remove_terrain_points_inside_building_buffer(terrain_df):
     buffer_gdf = buffer_gdf[buffer_gdf.geometry.notnull()].copy()
     buffer_gdf = buffer_gdf[~buffer_gdf.geometry.is_empty].copy()
 
-    # intersects 사용:
-    # 점이 버퍼 내부 또는 경계에 있으면 제거
+    # 버퍼 내부·경계 수음점 제거
     joined = gpd.sjoin(
         terrain_gdf,
         buffer_gdf[["geometry"]],
@@ -128,12 +153,52 @@ def remove_terrain_points_inside_building_buffer(terrain_df):
 def add_big_grid_id(df):
     df = df.copy()
 
-    df["big_grid_i"] = ((df["x_epsg5179"] - min_x) // big_grid_m).astype(int)
-    df["big_grid_j"] = ((df["y_epsg5179"] - min_y) // big_grid_m).astype(int)
+    big_grid_column_count_value = (max_x - min_x) / big_grid_m
+    big_grid_row_count_value = (max_y - min_y) / big_grid_m
+    if not np.isclose(
+        big_grid_column_count_value,
+        round(big_grid_column_count_value),
+    ):
+        raise ValueError("X 범위는 대격자 크기의 정수배여야 합니다.")
+    if not np.isclose(
+        big_grid_row_count_value,
+        round(big_grid_row_count_value),
+    ):
+        raise ValueError("Y 범위는 대격자 크기의 정수배여야 합니다.")
+
+    big_grid_column_count = int(round(big_grid_column_count_value))
+    big_grid_row_count = int(round(big_grid_row_count_value))
+
+    big_grid_i = np.floor(
+        (df["x_epsg5179"] - min_x) / big_grid_m
+    ).astype(int)
+    big_grid_j = np.floor(
+        (df["y_epsg5179"] - min_y) / big_grid_m
+    ).astype(int)
+
+    # 최대 경계 좌표의 마지막 대격자 귀속
+    df["big_grid_i"] = np.minimum(
+        big_grid_i,
+        big_grid_column_count - 1,
+    )
+    df["big_grid_j"] = np.minimum(
+        big_grid_j,
+        big_grid_row_count - 1,
+    )
+
+    # 좌표 기반 조회용 행 우선(row-major) 1차원 인덱스 생성
+    df["big_grid_column_count"] = big_grid_column_count
+    df["big_grid_row_count"] = big_grid_row_count
+    df["big_grid_row"] = (
+        big_grid_row_count - 1 - df["big_grid_j"]
+    )
+    df["big_grid_index"] = (
+        df["big_grid_row"] * big_grid_column_count
+        + df["big_grid_i"]
+    )
 
     df["big_grid_id"] = (
-        "G"
-        + df["big_grid_i"].astype(str).str.zfill(4)
+        df["big_grid_i"].astype(str).str.zfill(4)
         + "_"
         + df["big_grid_j"].astype(str).str.zfill(4)
     )
@@ -142,25 +207,45 @@ def add_big_grid_id(df):
 
 
 # =========================
-# receiver_id 부여 함수
+# receiver_id 및 스네이크 배열 인덱스 부여
 # =========================
 def assign_receiver_id(df):
     df = df.copy()
 
-    # 같은 좌표 판정을 위한 안정화 필드
-    # EPSG:5179 좌표는 mm 수준까지 필요 없으므로 0.001m 단위 반올림
+    if big_grid_m <= 0 or receiver_grid_m <= 0:
+        raise ValueError("대격자와 수음점 격자 크기는 0보다 커야 합니다.")
+
+    cells_per_big_grid = big_grid_m / receiver_grid_m
+    if not np.isclose(cells_per_big_grid, round(cells_per_big_grid)):
+        raise ValueError("대격자 크기는 수음점 격자 크기의 정수배여야 합니다.")
+
+    # 동일 좌표 안정 정렬용 mm 단위 키 생성
     df["x_key"] = df["x_epsg5179"].round(3)
     df["y_key"] = df["y_epsg5179"].round(3)
 
-    # 정렬 기준:
-    # 대격자 -> lat -> lon -> 동일 좌표면 alt 높은 순
+    grid_origin_y = min_y + df["big_grid_j"] * big_grid_m
+    df["local_grid_row_from_bottom"] = np.floor(
+        (df["y_epsg5179"] - grid_origin_y) / receiver_grid_m
+    ).astype(int)
+    df["local_grid_row"] = (
+        int(round(cells_per_big_grid))
+        - 1
+        - df["local_grid_row_from_bottom"]
+    )
+
+    # 상단 0행 기준 짝수 행 좌→우·홀수 행 우→좌 진행
+    df["snake_x_key"] = np.where(
+        df["local_grid_row"] % 2 == 0,
+        df["x_key"],
+        -df["x_key"],
+    )
+
+    # 행 우선 대격자 및 내부 스네이크 순서 정렬
     df = df.sort_values(
         by=[
-            "big_grid_j",
-            "big_grid_i",
-            "lat",
-            "lon",
-            "x_key",
+            "big_grid_index",
+            "local_grid_row",
+            "snake_x_key",
             "y_key",
             "alt",
         ],
@@ -169,18 +254,17 @@ def assign_receiver_id(df):
             True,
             True,
             True,
-            True,
-            True,
             False,
-        ]
+        ],
     ).reset_index(drop=True)
 
-    # 1부터 시작하는 정수 ID
-    df["receiver_id"] = range(1, len(df) + 1)
+    # 정렬 결과 기반 연속 수음점 ID 생성
+    df["receiver_id"] = np.arange(1, len(df) + 1, dtype=np.int64)
 
-    df = df.drop(columns=["x_key", "y_key"], errors="ignore")
-
-    return df
+    return df.drop(
+        columns=["x_key", "y_key", "snake_x_key"],
+        errors="ignore",
+    )
 
 
 # =========================
@@ -196,12 +280,22 @@ building_df = read_receiver_csv(
     receiver_type="building"
 )
 
+roof_df = read_receiver_csv(
+    roof_receiver_csv_path,
+    receiver_type="roof"
+)
+
+validate_receiver_bounds(terrain_df, "terrain")
+validate_receiver_bounds(building_df, "building")
+validate_receiver_bounds(roof_df, "roof")
+
 terrain_filtered = remove_terrain_points_inside_building_buffer(terrain_df)
 
 merged = pd.concat(
     [
         terrain_filtered,
         building_df,
+        roof_df,
     ],
     ignore_index=True
 )
@@ -239,4 +333,5 @@ print(" - output:", output_csv_path)
 print(" - rows:", len(out_df))
 print(" - terrain:", (out_df["type"] == "terrain").sum())
 print(" - building:", (out_df["type"] == "building").sum())
+print(" - roof:", (out_df["type"] == "roof").sum())
 print(out_df.head())

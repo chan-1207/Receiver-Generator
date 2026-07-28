@@ -12,7 +12,7 @@ from shapely.geometry import LineString, MultiLineString
 # 설정값
 # =========================
 input_contour_path = "../data/terrain/ulsan.shp"
-output_csv_path = "../receivers/terrain/terrain_receivers.csv"
+output_csv_path = "../receivers/terrain/cropped_terrain_receivers_center.csv"
 
 elev_field = "CONT"
 
@@ -35,15 +35,6 @@ debug_grid_csv_path = "../receivers/terrain/debug_grid_10m.csv"
 
 
 # =========================
-# 출력 폴더 생성
-# =========================
-os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
-
-if save_debug_grid:
-    os.makedirs(os.path.dirname(debug_grid_csv_path), exist_ok=True)
-
-
-# =========================
 # 격자 생성 함수
 # =========================
 def make_grid():
@@ -53,30 +44,30 @@ def make_grid():
         always_xy=True
     )
 
-    xs = np.arange(min_x, max_x + grid_m, grid_m)
-    ys = np.arange(min_y, max_y + grid_m, grid_m)
+    x_cell_count = (max_x - min_x) / grid_m
+    y_cell_count = (max_y - min_y) / grid_m
+    if not np.isclose(x_cell_count, round(x_cell_count)):
+        raise ValueError("X 범위는 격자 크기의 정수배여야 합니다.")
+    if not np.isclose(y_cell_count, round(y_cell_count)):
+        raise ValueError("Y 범위는 격자 크기의 정수배여야 합니다.")
 
-    rows = []
+    # 셀 중앙 수음점 배치
+    xs = min_x + (np.arange(int(round(x_cell_count))) + 0.5) * grid_m
+    ys = min_y + (np.arange(int(round(y_cell_count))) + 0.5) * grid_m
 
-    for grid_j, y in enumerate(ys):
-        x_iter = list(enumerate(xs))
+    # 행 우선 배열 기반 수음점 좌표 생성
+    grid_x, grid_y = np.meshgrid(xs, ys, indexing="xy")
+    flat_x = grid_x.ravel(order="C")
+    flat_y = grid_y.ravel(order="C")
+    lon, lat = transformer.transform(flat_x, flat_y)
 
-        # snake 순서 유지
-        if grid_j % 2 == 1:
-            x_iter = reversed(x_iter)
-
-        for grid_i, x in x_iter:
-            lon, lat = transformer.transform(float(x), float(y))
-
-            rows.append({
-                "reference": "",
-                "x_epsg5179": float(x),
-                "y_epsg5179": float(y),
-                "lat": float(lat),
-                "lon": float(lon),
-            })
-
-    return pd.DataFrame(rows)
+    return pd.DataFrame({
+        "reference": "",
+        "x_epsg5179": flat_x,
+        "y_epsg5179": flat_y,
+        "lat": lat,
+        "lon": lon,
+    })
 
 
 # =========================
