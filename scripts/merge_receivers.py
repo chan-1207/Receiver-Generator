@@ -21,6 +21,7 @@ crs_epsg = "EPSG:5179"
 
 big_grid_m = 100
 receiver_grid_m = 10
+grid_boundary_tolerance_m = 1.0e-6
 
 min_x = 1163000
 max_x = 1164000
@@ -170,28 +171,38 @@ def add_big_grid_id(df):
     big_grid_row_count = int(round(big_grid_row_count_value))
 
     big_grid_i = np.floor(
-        (df["x_epsg5179"] - min_x) / big_grid_m
+        (
+            df["x_epsg5179"]
+            - min_x
+            + grid_boundary_tolerance_m
+        )
+        / big_grid_m
     ).astype(int)
-    big_grid_j = np.floor(
-        (df["y_epsg5179"] - min_y) / big_grid_m
+    big_grid_row = np.floor(
+        (
+            max_y
+            - df["y_epsg5179"]
+            + grid_boundary_tolerance_m
+        )
+        / big_grid_m
     ).astype(int)
 
-    # 최대 경계 좌표의 마지막 대격자 귀속
+    # 최외곽 최대 인덱스 제한
     df["big_grid_i"] = np.minimum(
         big_grid_i,
         big_grid_column_count - 1,
     )
-    df["big_grid_j"] = np.minimum(
-        big_grid_j,
+    df["big_grid_row"] = np.minimum(
+        big_grid_row,
         big_grid_row_count - 1,
+    )
+    df["big_grid_j"] = (
+        big_grid_row_count - 1 - df["big_grid_row"]
     )
 
     # 좌표 기반 조회용 행 우선(row-major) 1차원 인덱스 생성
     df["big_grid_column_count"] = big_grid_column_count
     df["big_grid_row_count"] = big_grid_row_count
-    df["big_grid_row"] = (
-        big_grid_row_count - 1 - df["big_grid_j"]
-    )
     df["big_grid_index"] = (
         df["big_grid_row"] * big_grid_column_count
         + df["big_grid_i"]
@@ -223,14 +234,18 @@ def assign_receiver_id(df):
     df["x_key"] = df["x_epsg5179"].round(3)
     df["y_key"] = df["y_epsg5179"].round(3)
 
-    grid_origin_y = min_y + df["big_grid_j"] * big_grid_m
-    df["local_grid_row_from_bottom"] = np.floor(
-        (df["y_epsg5179"] - grid_origin_y) / receiver_grid_m
+    grid_top_y = max_y - df["big_grid_row"] * big_grid_m
+    local_grid_row = np.floor(
+        (
+            grid_top_y
+            - df["y_epsg5179"]
+            + grid_boundary_tolerance_m
+        )
+        / receiver_grid_m
     ).astype(int)
-    df["local_grid_row"] = (
-        int(round(cells_per_big_grid))
-        - 1
-        - df["local_grid_row_from_bottom"]
+    df["local_grid_row"] = np.minimum(
+        local_grid_row,
+        int(round(cells_per_big_grid)) - 1,
     )
 
     # 상단 0행 기준 짝수 행 좌→우·홀수 행 우→좌 진행
