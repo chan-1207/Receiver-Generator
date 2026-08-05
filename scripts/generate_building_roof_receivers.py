@@ -1,5 +1,6 @@
 import math
 import os
+from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
@@ -14,10 +15,23 @@ from shapely.validation import make_valid
 # =========================
 # 설정값
 # =========================
-input_building_gpkg_path = "../data/building_height/building_cropped_height.gpkg"
-output_csv_path = "../receivers/building/cropped_building_roof_receivers.csv"
+project_dir = Path(__file__).resolve().parents[1]
 
-input_layer_name = "TN_BULD"
+input_building_buffer_gpkg_path = Path(os.environ.get(
+    "RECEIVER_BUFFER_INPUT_GPKG",
+    project_dir / "receivers/building/cropped_building_buffers_10m.gpkg",
+))
+input_building_metadata_gpkg_path = Path(os.environ.get(
+    "BUILDING_METADATA_INPUT_GPKG",
+    project_dir / "metadata/building/building_cropped_metadata.gpkg",
+))
+output_csv_path = Path(os.environ.get(
+    "ROOF_RECEIVER_OUTPUT_CSV",
+    project_dir / "receivers/building/cropped_building_roof_receivers.csv",
+))
+
+input_buffer_layer_name = "building_buffer"
+input_metadata_layer_name = "building_metadata"
 
 id_col = "NF_ID"
 top_col = "BLDH_BV"
@@ -358,21 +372,31 @@ def make_oriented_grid_candidates(poly, resolution):
     return candidates
 
 
-def make_roof_receiver_points(geom):
+def make_roof_receiver_points(geom, original_geom=None):
     """지붕 안전영역 내 수음점 생성"""
     if geom is None or geom.is_empty:
         return [], "empty", 0
 
+    if original_geom is None:
+        original_geom = geom
+
+    containment_geom = clean_geom(geom.intersection(original_geom))
+
+    if containment_geom is None or containment_geom.is_empty:
+        return [], "empty", 0
+
     pieces = decompose_geometry(geom)
 
-    # 외벽 수음점과 거리를 두기 위해 해상도의 절반만큼 안쪽으로 줄인다.
+    # 외벽 수음점과의 이격 확보를 위한 외측 버퍼 기준 내측 축소
     roof_geom = clean_geom(
-        geom.buffer(-roof_inset_m, join_style="mitre")
+        geom
+        .buffer(-roof_inset_m, join_style="mitre")
+        .intersection(original_geom)
     )
 
-    # 안쪽 버퍼가 사라지면 원본 건물의 기하학적 중심에 한 점을 배치한다.
+    # 지붕 안전영역 소멸 시 버퍼·원본 교집합의 중심점 배치
     if roof_geom is None or roof_geom.is_empty:
-        return [get_geometric_center(geom)], "center", len(pieces)
+        return [get_geometric_center(containment_geom)], "center", len(pieces)
 
     points = []
     seen_xy = set()
@@ -386,19 +410,19 @@ def make_roof_receiver_points(geom):
 
         safe_piece_with_tolerance = safe_piece.buffer(1e-8)
         candidates = make_oriented_grid_candidates(
-            poly,
+            safe_piece,
             roof_resolution_m
         )
         piece_points = []
 
-        # 현재 조각의 축소 안전 영역에 포함되는 후보점만 유지한다.
+        # 현재 조각의 축소 안전영역 내부 후보점 선별
         for point in candidates:
             if not safe_piece_with_tolerance.covers(point):
                 continue
 
             piece_points.append(point)
 
-        # 후보가 없거나 하나뿐이면 해당 조각의 기하학적 중심에 한 점을 배치한다.
+        # 후보가 하나 이하인 조각의 기하학적 중심점 배치
         if len(piece_points) <= 1:
             piece_points = [get_geometric_center(safe_piece)]
 
@@ -415,10 +439,9 @@ def make_roof_receiver_points(geom):
     if len(points) == 0:
         return [get_geometric_center(roof_geom)], "center", len(pieces)
 
-    # 최종 수음점이 하나뿐이면 축소 형상에 치우치지 않도록
-    # 원본 건물 폴리곤의 기하학적 중심으로 다시 배치한다.
+    # 최종 수음점이 하나일 때 버퍼·원본 교집합의 중심점 재배치
     if len(points) == 1:
-        return [get_geometric_center(geom)], "center", len(pieces)
+        return [get_geometric_center(containment_geom)], "center", len(pieces)
 
     placement_type = "grid" if len(points) > 1 else "center"
 
@@ -427,13 +450,13 @@ def make_roof_receiver_points(geom):
 
 def load_buildings():
     """입력 건물 데이터 로드 및 필터링"""
-    if input_layer_name:
+    if input_buffer_layer_name:
         buildings = gpd.read_file(
-            input_building_gpkg_path,
-            layer=input_layer_name
+            input_building_buffer_gpkg_path,
+            layer=input_buffer_layer_name
         )
     else:
-        buildings = gpd.read_file(input_building_gpkg_path)
+        buildings = gpd.read_file(input_building_buffer_gpkg_path)
 
     if buildings.crs is None:
         raise ValueError("건물 GPKG에 CRS가 없습니다.")
@@ -473,6 +496,80 @@ def load_buildings():
         & (buildings[area_col] >= min_building_area_m2)
     ].copy()
 
+    duplicate_building_id_mask = buildings[id_col].astype(str).duplicated(
+        keep=False
+    )
+
+    if duplicate_building_id_mask.any():
+        duplicate_ids = buildings.loc[
+            duplicate_building_id_mask,
+            id_col,
+        ].head(5).tolist()
+        raise ValueError(f"건물 버퍼에 중복 ID가 있습니다: {duplicate_ids}")
+
+    original_buildings = gpd.read_file(
+        input_building_metadata_gpkg_path,
+        layer=input_metadata_layer_name
+    )
+
+    if original_buildings.crs is None:
+        raise ValueError("건물 메타데이터 GPKG의 CRS가 없습니다.")
+
+    if id_col not in original_buildings.columns:
+        raise ValueError(
+            f"건물 메타데이터 레이어에 ID 필드가 없습니다: {id_col}"
+        )
+
+    if original_buildings.crs != buildings.crs:
+        original_buildings = original_buildings.to_crs(buildings.crs)
+
+    original_buildings = original_buildings[
+        original_buildings.geometry.notnull()
+    ].copy()
+    original_buildings["geometry"] = (
+        original_buildings.geometry.apply(clean_geom)
+    )
+    original_buildings = original_buildings[
+        original_buildings.geometry.notnull()
+    ].copy()
+    original_buildings = original_buildings[
+        ~original_buildings.geometry.is_empty
+    ].copy()
+    original_buildings["_reference_key"] = (
+        original_buildings[id_col].astype(str)
+    )
+    duplicate_reference_mask = original_buildings[
+        "_reference_key"
+    ].duplicated(keep=False)
+
+    if duplicate_reference_mask.any():
+        duplicate_ids = original_buildings.loc[
+            duplicate_reference_mask,
+            id_col,
+        ].head(5).tolist()
+        raise ValueError(f"건물 메타데이터에 중복 ID가 있습니다: {duplicate_ids}")
+
+    original_geometry_by_id = original_buildings.set_index(
+        "_reference_key"
+    ).geometry
+
+    buildings["_reference_key"] = buildings[id_col].astype(str)
+    buildings["original_geometry"] = buildings[
+        "_reference_key"
+    ].map(original_geometry_by_id)
+
+    missing_original_count = int(
+        buildings["original_geometry"].isna().sum()
+    )
+
+    if missing_original_count > 0:
+        raise ValueError(
+            "메타데이터 원본 형상을 찾지 못한 버퍼 건물이 있습니다: "
+            f"{missing_original_count}개"
+        )
+
+    buildings = buildings.drop(columns="_reference_key")
+
     buildings = buildings.reset_index(drop=True)
 
     return buildings
@@ -489,7 +586,8 @@ def generate_receivers(buildings, transformer):
     for _, row in buildings.iterrows():
         original_part_count = len(polygon_parts(row.geometry))
         points, placement_type, piece_count = make_roof_receiver_points(
-            row.geometry
+            row.geometry,
+            row["original_geometry"]
         )
         total_piece_count += piece_count
 
@@ -548,7 +646,7 @@ def generate_receivers(buildings, transformer):
     print("saved:", output_csv_path)
 
 def main():
-    os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
+    output_csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     buildings = load_buildings()
     transformer = Transformer.from_crs(

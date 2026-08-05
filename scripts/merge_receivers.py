@@ -9,13 +9,13 @@ from shapely.geometry import Point
 # 설정값
 # =========================
 terrain_receiver_csv_path = "../receivers/terrain/cropped_terrain_receivers_center.csv"
-building_receiver_csv_path = "../receivers/building/cropped_building_receivers_new.csv"
+building_receiver_csv_path = "../receivers/building/cropped_building_receivers.csv"
 roof_receiver_csv_path = "../receivers/building/cropped_building_roof_receivers.csv"
 building_buffer_gpkg_path = "../receivers/building/cropped_building_buffers_10m.gpkg"
 
-output_csv_path = "../receivers/cropped_merged_receivers_center.csv"
+output_csv_path = "../receivers/cropped_merged_receivers.csv"
 
-buffer_layer_name = None
+buffer_layer_name = "building_buffer"
 
 crs_epsg = "EPSG:5179"
 
@@ -200,12 +200,17 @@ def add_big_grid_id(df):
         big_grid_row_count - 1 - df["big_grid_row"]
     )
 
-    # 좌표 기반 조회용 행 우선(row-major) 1차원 인덱스 생성
+    # 대격자 행별 스네이크 순회 순번 생성
     df["big_grid_column_count"] = big_grid_column_count
     df["big_grid_row_count"] = big_grid_row_count
-    df["big_grid_index"] = (
+    big_grid_x_order = np.where(
+        df["big_grid_row"] % 2 == 0,
+        df["big_grid_i"],
+        big_grid_column_count - 1 - df["big_grid_i"],
+    )
+    df["big_grid_order"] = (
         df["big_grid_row"] * big_grid_column_count
-        + df["big_grid_i"]
+        + big_grid_x_order
     )
 
     df["big_grid_id"] = (
@@ -248,17 +253,20 @@ def assign_receiver_id(df):
         int(round(cells_per_big_grid)) - 1,
     )
 
-    # 상단 0행 기준 짝수 행 좌→우·홀수 행 우→좌 진행
+    # 대격자 진행 방향을 반영한 내부 스네이크 방향
+    local_row_moves_left_to_right = (
+        (df["local_grid_row"] + df["big_grid_row"]) % 2 == 0
+    )
     df["snake_x_key"] = np.where(
-        df["local_grid_row"] % 2 == 0,
+        local_row_moves_left_to_right,
         df["x_key"],
         -df["x_key"],
     )
 
-    # 행 우선 대격자 및 내부 스네이크 순서 정렬
+    # 대격자 및 내부 수음점 스네이크 순서 정렬
     df = df.sort_values(
         by=[
-            "big_grid_index",
+            "big_grid_order",
             "local_grid_row",
             "snake_x_key",
             "y_key",
@@ -327,6 +335,7 @@ output_cols = [
     "reference",
     "type",
     "big_grid_id",
+    "big_grid_order",
     "x_epsg5179",
     "y_epsg5179",
     "lat",

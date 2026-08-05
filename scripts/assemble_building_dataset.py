@@ -1,23 +1,52 @@
 import os
-import pandas as pd
+from pathlib import Path
+
 import geopandas as gpd
+import pandas as pd
+from shapely.affinity import translate
+from shapely.geometry import MultiPolygon, Polygon
+from shapely.validation import make_valid
 
 
 # =========================================================
 # 경로 설정
 # =========================================================
-input_building_height_gpkg_path = "../data/building_height/building_cropped_height.gpkg"
-input_building_register_csv_path = "../data/building_register/building_register.csv"
+project_dir = Path(__file__).resolve().parents[1]
 
-output_gpkg_path = "../metadata/building_metadata/building_crop_metadata.gpkg"
-output_csv_path = "../metadata/building_metadata/building_crop_metadata.csv"
-output_raw_mapping_cvs_path = "../config/building_cropped_raw_mapping.csv"
+input_building_height_gpkg_path = Path(os.environ.get(
+    "BUILDING_HEIGHT_INPUT_GPKG",
+    project_dir / "data/building_height/building_cropped_height.gpkg",
+))
+input_building_register_csv_path = Path(os.environ.get(
+    "BUILDING_REGISTER_INPUT_CSV",
+    project_dir / "data/building_register/building_register.csv",
+))
 
-output_layer = "building_metadata"
+output_gpkg_path = Path(os.environ.get(
+    "BUILDING_METADATA_OUTPUT_GPKG",
+    project_dir / "metadata/building/building_cropped_metadata.gpkg",
+))
+output_csv_path = Path(os.environ.get(
+    "BUILDING_METADATA_OUTPUT_CSV",
+    project_dir / "metadata/building/building_cropped_metadata.csv",
+))
+output_raw_mapping_csv_path = Path(os.environ.get(
+    "BUILDING_RAW_MAPPING_OUTPUT_CSV",
+    project_dir / "config/building_cropped_raw_mapping.csv",
+))
+
+input_building_height_layer = "TN_BULD"
+metadata_layer = "building_metadata"
+simplified_layer = "building_simplified"
+mrr_layer = "building_mrr"
+
+closing_distance_m = 10.0
+simplify_tolerance_m = 1.0
+mrr_padding_m = 0.001
 
 # 출력 폴더 생성
-for path in [output_gpkg_path, output_csv_path, output_raw_mapping_cvs_path]:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+for path in [output_gpkg_path, output_csv_path, output_raw_mapping_csv_path]:
+    path.parent.mkdir(parents=True, exist_ok=True)
 
 
 # =========================================================
@@ -105,6 +134,114 @@ def mode_or_null(series):
         return "NULL"
 
     return values.value_counts().idxmax()
+
+
+def polygon_parts(geom):
+    """Polygon 조각 목록"""
+    if geom is None or geom.is_empty:
+        return []
+
+    if geom.geom_type == "Polygon":
+        return [geom]
+
+    if geom.geom_type == "MultiPolygon":
+        return list(geom.geoms)
+
+    if geom.geom_type == "GeometryCollection":
+        parts = []
+
+        for part in geom.geoms:
+            parts.extend(polygon_parts(part))
+
+        return parts
+
+    return []
+
+
+def to_multipolygon(geom):
+    """유효 MultiPolygon 변환"""
+    if geom is None or geom.is_empty:
+        return None
+
+    valid_geom = make_valid(geom)
+    parts = [
+        part
+        for part in polygon_parts(valid_geom)
+        if not part.is_empty and part.area > 0
+    ]
+
+    if len(parts) == 0:
+        return None
+
+    return MultiPolygon(parts)
+
+
+def simplify_building_polygon(geom):
+    """공통 건물 폴리곤 단순화"""
+    source_geom = to_multipolygon(geom)
+
+    if source_geom is None:
+        return None
+
+    # 미세 요철과 좁은 홈 제거
+    closed_geom = source_geom.buffer(
+        closing_distance_m,
+        join_style="mitre",
+    ).buffer(
+        -closing_distance_m,
+        join_style="mitre",
+    )
+    closed_geom = to_multipolygon(closed_geom)
+
+    # 모폴로지 연산 소멸 시 원본 형상 사용
+    if closed_geom is None:
+        closed_geom = source_geom
+
+    # 위상 보존 꼭짓점 단순화
+    simplified_geom = closed_geom.simplify(
+        simplify_tolerance_m,
+        preserve_topology=True,
+    )
+    simplified_geom = to_multipolygon(simplified_geom)
+
+    if simplified_geom is None:
+        return source_geom
+
+    return simplified_geom
+
+
+def make_minimum_rotated_rectangle(geom):
+    """로컬 좌표 기반 최소면적 회전사각형"""
+    if geom is None or geom.is_empty:
+        return None
+
+    center = geom.centroid
+    local_geom = translate(
+        geom,
+        xoff=-center.x,
+        yoff=-center.y,
+    )
+    local_rectangle = local_geom.minimum_rotated_rectangle
+
+    if local_rectangle is None or local_rectangle.is_empty:
+        return None
+
+    # 후보군 누락 방지용 수치 안전 여유
+    local_rectangle = local_rectangle.buffer(
+        mrr_padding_m,
+        join_style="mitre",
+    )
+
+    rectangle = translate(
+        local_rectangle,
+        xoff=center.x,
+        yoff=center.y,
+    )
+
+    if not isinstance(rectangle, Polygon) or rectangle.area <= 0:
+        return None
+
+    return rectangle
 
 
 # =========================================================
@@ -300,22 +437,31 @@ def estimate_wall_mat_code(struct_code, use_code):
     return 0
 
 
+def estimate_reflection_code(wall_mat_code):
+    """벽면 재질 기반 반사 코드"""
+    if wall_mat_code in [0, 1]:
+        return 4
+    if wall_mat_code in [2, 3]:
+        return 3
+    if wall_mat_code == 4:
+        return 2
+
+    return 4
+
+
 # =========================================================
 # 건물높이정보 로드
 # =========================================================
 print("[1] 건물높이정보 로드")
 
-bld = gpd.read_file(input_building_height_gpkg_path)
+bld = gpd.read_file(
+    input_building_height_gpkg_path,
+    layer=input_building_height_layer,
+)
 
 print(" - rows:", len(bld))
 print(" - crs:", bld.crs)
 print(" - columns:", list(bld.columns))
-
-required_bld_cols = ["NF_ID", "PNU_NO", "geometry"]
-missing_bld = [c for c in required_bld_cols if c not in bld.columns]
-
-if missing_bld:
-    raise ValueError(f"건물높이정보에 필수 필드가 없음: {missing_bld}")
 
 bld_keep = [
     "NF_ID",
@@ -326,14 +472,49 @@ bld_keep = [
     "BLDH_BV",
     "BLDH_MX",
     "BLDFH_MX",
+    "Shape_Area",
     "geometry",
 ]
+missing_bld = [col for col in bld_keep if col not in bld.columns]
 
-bld_keep = [c for c in bld_keep if c in bld.columns]
+if missing_bld:
+    raise ValueError(f"건물높이정보에 필수 필드가 없음: {missing_bld}")
+
+if bld.crs is None:
+    raise ValueError("건물높이정보에 CRS가 없음")
+
+if bld.crs.is_geographic:
+    raise ValueError("건물 단순화에는 미터 단위 투영 좌표계가 필요함")
+
 bld = bld[bld_keep].copy()
 
 bld["NF_ID"] = bld["NF_ID"].apply(clean_str)
 bld["PNU_NO"] = bld["PNU_NO"].apply(clean_str)
+
+invalid_id_mask = bld["NF_ID"] == "NULL"
+
+if invalid_id_mask.any():
+    raise ValueError(
+        "NF_ID가 없는 건물높이정보가 있음: "
+        f"{int(invalid_id_mask.sum())}개"
+    )
+
+duplicate_id_mask = bld["NF_ID"].duplicated(keep=False)
+
+if duplicate_id_mask.any():
+    duplicate_ids = bld.loc[duplicate_id_mask, "NF_ID"].head(5).tolist()
+    raise ValueError(f"중복 NF_ID가 있음: {duplicate_ids}")
+
+bld["geometry"] = bld.geometry.apply(to_multipolygon)
+invalid_geometry_mask = (
+    bld.geometry.isna()
+    | bld.geometry.is_empty
+    | ~bld.geometry.is_valid
+)
+
+if invalid_geometry_mask.any():
+    invalid_ids = bld.loc[invalid_geometry_mask, "NF_ID"].head(5).tolist()
+    raise ValueError(f"유효한 건물 형상이 없는 NF_ID가 있음: {invalid_ids}")
 
 # 건물높이정보 PNU 뒤 9자리
 bld["PNU_SUFFIX"] = bld["PNU_NO"].apply(lambda x: clean_str(x)[-9:])
@@ -426,6 +607,9 @@ meta["WALL_MAT_CODE"] = meta.apply(
     lambda r: estimate_wall_mat_code(r["STRUCT_CODE"], r["USE_CODE"]),
     axis=1,
 ).astype("int16")
+meta["REFL_CODE"] = meta["WALL_MAT_CODE"].apply(
+    estimate_reflection_code
+).astype("int16")
 
 # =========================================================
 # 최종 필드 정리
@@ -442,15 +626,77 @@ final_cols = [
     "BLDH_BV",
     "BLDH_MX",
     "BLDFH_MX",
+    "Shape_Area",
     "STRUCT_CODE",
     "USE_CODE",
     "ROOF_CODE",
     "WALL_MAT_CODE",
+    "REFL_CODE",
     "geometry",
 ]
 
-final_cols = [c for c in final_cols if c in meta.columns]
+missing_final_cols = [col for col in final_cols if col not in meta.columns]
+
+if missing_final_cols:
+    raise ValueError(f"최종 필수 필드가 없음: {missing_final_cols}")
+
 meta_final = meta[final_cols].copy()
+
+# 공통 단순화 형상 생성
+simplified_gdf = meta_final[["NF_ID", "geometry"]].copy()
+simplified_gdf["geometry"] = simplified_gdf.geometry.apply(
+    simplify_building_polygon
+)
+simplified_invalid_mask = (
+    simplified_gdf.geometry.isna()
+    | simplified_gdf.geometry.is_empty
+    | ~simplified_gdf.geometry.is_valid
+)
+
+if simplified_invalid_mask.any():
+    invalid_ids = simplified_gdf.loc[
+        simplified_invalid_mask,
+        "NF_ID",
+    ].head(5).tolist()
+    raise ValueError(f"공통 단순화 형상 생성 실패 NF_ID: {invalid_ids}")
+
+# 최소면적 회전사각형 생성
+mrr_gdf = simplified_gdf.copy()
+mrr_gdf["geometry"] = mrr_gdf.geometry.apply(
+    make_minimum_rotated_rectangle
+)
+mrr_gdf["MRR_PAD_M"] = mrr_padding_m
+mrr_invalid_mask = (
+    mrr_gdf.geometry.isna()
+    | mrr_gdf.geometry.is_empty
+    | ~mrr_gdf.geometry.is_valid
+)
+
+if mrr_invalid_mask.any():
+    invalid_ids = mrr_gdf.loc[
+        mrr_invalid_mask,
+        "NF_ID",
+    ].head(5).tolist()
+    raise ValueError(f"최소면적 회전사각형 생성 실패 NF_ID: {invalid_ids}")
+
+mrr_covers_mask = mrr_gdf.geometry.covers(
+    simplified_gdf.geometry,
+    align=False,
+)
+
+if not mrr_covers_mask.all():
+    uncovered_ids = mrr_gdf.loc[
+        ~mrr_covers_mask,
+        "NF_ID",
+    ].head(5).tolist()
+    raise ValueError(f"단순화 형상을 포함하지 않는 MRR NF_ID: {uncovered_ids}")
+
+if not (
+    len(meta_final) == len(simplified_gdf) == len(mrr_gdf)
+    and set(meta_final["NF_ID"]) == set(simplified_gdf["NF_ID"])
+    and set(meta_final["NF_ID"]) == set(mrr_gdf["NF_ID"])
+):
+    raise ValueError("건물 레이어 간 NF_ID 구성이 일치하지 않음")
 
 
 # =========================================================
@@ -528,13 +774,49 @@ raw_mapping["code_label_en"] = raw_mapping.apply(
 # =========================================================
 print("[7] 저장")
 
-if os.path.exists(output_gpkg_path):
-    os.remove(output_gpkg_path)
+temporary_output_gpkg_path = output_gpkg_path.with_name(
+    f"{output_gpkg_path.stem}.tmp{output_gpkg_path.suffix}"
+)
 
-meta_final.to_file(output_gpkg_path, layer=output_layer, driver="GPKG")
+if temporary_output_gpkg_path.exists():
+    temporary_output_gpkg_path.unlink()
+
+meta_final.to_file(
+    temporary_output_gpkg_path,
+    layer=metadata_layer,
+    driver="GPKG",
+    index=False,
+)
+simplified_gdf.to_file(
+    temporary_output_gpkg_path,
+    layer=simplified_layer,
+    driver="GPKG",
+    mode="a",
+    index=False,
+)
+mrr_gdf.to_file(
+    temporary_output_gpkg_path,
+    layer=mrr_layer,
+    driver="GPKG",
+    mode="a",
+    index=False,
+)
+
+written_layers = set(
+    gpd.list_layers(temporary_output_gpkg_path)["name"]
+)
+expected_layers = {metadata_layer, simplified_layer, mrr_layer}
+
+if written_layers != expected_layers:
+    raise ValueError(
+        "GeoPackage 레이어 저장 결과가 올바르지 않음: "
+        f"{sorted(written_layers)}"
+    )
+
+os.replace(temporary_output_gpkg_path, output_gpkg_path)
 
 meta_final.drop(columns="geometry").to_csv(output_csv_path, index=False, encoding="utf-8-sig")
-raw_mapping.to_csv(output_raw_mapping_cvs_path, index=False, encoding="utf-8-sig")
+raw_mapping.to_csv(output_raw_mapping_csv_path, index=False, encoding="utf-8-sig")
 
 
 # =========================================================
@@ -543,10 +825,20 @@ raw_mapping.to_csv(output_raw_mapping_cvs_path, index=False, encoding="utf-8-sig
 print("\n[DONE]")
 print(" -", output_gpkg_path)
 print(" -", output_csv_path)
-print(" -", output_raw_mapping_cvs_path)
+print(" -", output_raw_mapping_csv_path)
+print(" - layers:", [metadata_layer, simplified_layer, mrr_layer])
+print(" - simplification closing [m]:", closing_distance_m)
+print(" - simplification tolerance [m]:", simplify_tolerance_m)
+print(" - MRR safety padding [m]:", mrr_padding_m)
 
 print("\n[CODE COUNTS]")
-for col in ["STRUCT_CODE", "USE_CODE", "ROOF_CODE", "WALL_MAT_CODE"]:
+for col in [
+    "STRUCT_CODE",
+    "USE_CODE",
+    "ROOF_CODE",
+    "WALL_MAT_CODE",
+    "REFL_CODE",
+]:
     print(f"\n{col}")
     print(meta_final[col].value_counts(dropna=False).sort_index())
 

@@ -1,4 +1,6 @@
 import os
+from pathlib import Path
+
 import geopandas as gpd
 import pandas as pd
 import numpy as np
@@ -9,10 +11,18 @@ from pyproj import Transformer
 # =========================
 # 설정값
 # =========================
-input_polygon_gpkg_path = "../receivers/building/cropped_building_buffers_10m.gpkg"
-output_cvs_path = "../receivers/building/cropped_building_receivers_new.csv"
+project_dir = Path(__file__).resolve().parents[1]
 
-input_layer_name = None  # None = 첫 번째 레이어 자동 선택
+input_polygon_gpkg_path = Path(os.environ.get(
+    "RECEIVER_BUFFER_INPUT_GPKG",
+    project_dir / "receivers/building/cropped_building_buffers_10m.gpkg",
+))
+output_cvs_path = Path(os.environ.get(
+    "WALL_RECEIVER_OUTPUT_CSV",
+    project_dir / "receivers/building/cropped_building_receivers.csv",
+))
+
+input_layer_name = "building_buffer"
 
 id_col = "NF_ID"
 base_col = "BLDH_MN"   # 건물 지반 절대고도
@@ -30,7 +40,7 @@ max_y = 1733000
 
 z_tolerance_m = 0.05
 
-os.makedirs(os.path.dirname(output_cvs_path), exist_ok=True)
+output_cvs_path.parent.mkdir(parents=True, exist_ok=True)
 
 # =========================
 # 보조 함수
