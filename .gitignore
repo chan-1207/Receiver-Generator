@@ -1,6 +1,6 @@
 .idea/
 .venv/
 .etc/
-.tmp/
+tmp/
 *.gpkg-shm
 *.gpkg-wal
