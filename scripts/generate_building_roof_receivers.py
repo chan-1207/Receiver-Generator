@@ -535,27 +535,27 @@ def load_buildings():
     original_buildings = original_buildings[
         ~original_buildings.geometry.is_empty
     ].copy()
-    original_buildings["_reference_key"] = (
+    original_buildings["_building_id_key"] = (
         original_buildings[id_col].astype(str)
     )
-    duplicate_reference_mask = original_buildings[
-        "_reference_key"
+    duplicate_building_id_mask = original_buildings[
+        "_building_id_key"
     ].duplicated(keep=False)
 
-    if duplicate_reference_mask.any():
+    if duplicate_building_id_mask.any():
         duplicate_ids = original_buildings.loc[
-            duplicate_reference_mask,
+            duplicate_building_id_mask,
             id_col,
         ].head(5).tolist()
         raise ValueError(f"건물 메타데이터에 중복 ID가 있습니다: {duplicate_ids}")
 
     original_geometry_by_id = original_buildings.set_index(
-        "_reference_key"
+        "_building_id_key"
     ).geometry
 
-    buildings["_reference_key"] = buildings[id_col].astype(str)
+    buildings["_building_id_key"] = buildings[id_col].astype(str)
     buildings["original_geometry"] = buildings[
-        "_reference_key"
+        "_building_id_key"
     ].map(original_geometry_by_id)
 
     missing_original_count = int(
@@ -568,7 +568,7 @@ def load_buildings():
             f"{missing_original_count}개"
         )
 
-    buildings = buildings.drop(columns="_reference_key")
+    buildings = buildings.drop(columns="_building_id_key")
 
     buildings = buildings.reset_index(drop=True)
 
@@ -599,7 +599,7 @@ def generate_receivers(buildings, transformer):
         elif placement_type == "grid":
             grid_building_count += 1
 
-        reference = row[id_col]
+        building_id = row[id_col]
         roof_alt = float(row[top_col]) + roof_height_offset_m
 
         for point in points:
@@ -607,7 +607,7 @@ def generate_receivers(buildings, transformer):
             lon, lat = transformer.transform(x, y)
 
             records.append({
-                "reference": reference,
+                "building_id": building_id,
                 "x_epsg5179": x,
                 "y_epsg5179": y,
                 "lat": lat,
@@ -619,7 +619,7 @@ def generate_receivers(buildings, transformer):
         raise ValueError("생성된 지붕 수음점이 없습니다.")
 
     output_cols = [
-        "reference",
+        "building_id",
         "x_epsg5179",
         "y_epsg5179",
         "lat",

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import geopandas as gpd
@@ -8,12 +10,22 @@ from shapely.geometry import Point
 # =========================
 # 설정값
 # =========================
-terrain_receiver_csv_path = "../receivers/terrain/cropped_terrain_receivers_center.csv"
-building_receiver_csv_path = "../receivers/building/cropped_building_receivers.csv"
-roof_receiver_csv_path = "../receivers/building/cropped_building_roof_receivers.csv"
-building_buffer_gpkg_path = "../receivers/building/cropped_building_buffers_10m.gpkg"
+project_dir = Path(__file__).resolve().parents[1]
 
-output_csv_path = "../receivers/cropped_merged_receivers.csv"
+terrain_receiver_csv_path = (
+    project_dir / "receivers/terrain/cropped_terrain_receivers_center.csv"
+)
+building_receiver_csv_path = (
+    project_dir / "receivers/building/cropped_building_receivers.csv"
+)
+roof_receiver_csv_path = (
+    project_dir / "receivers/building/cropped_building_roof_receivers.csv"
+)
+building_buffer_gpkg_path = (
+    project_dir / "receivers/building/cropped_building_buffers_10m.gpkg"
+)
+
+output_csv_path = project_dir / "receivers/cropped_merged_receivers.csv"
 
 buffer_layer_name = "building_buffer"
 
@@ -42,13 +54,19 @@ def read_receiver_csv(csv_path, receiver_type):
         "lon",
         "alt",
     ]
+    if receiver_type == "terrain":
+        required_cols.append("ground_factor")
+    else:
+        required_cols.append("building_id")
 
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         raise ValueError(f"{csv_path} 필수 필드 없음: {missing}")
 
-    if "reference" not in df.columns:
-        df["reference"] = None
+    if "building_id" not in df.columns:
+        df["building_id"] = None
+    if "ground_factor" not in df.columns:
+        df["ground_factor"] = np.nan
 
     df["type"] = receiver_type
 
@@ -57,6 +75,10 @@ def read_receiver_csv(csv_path, receiver_type):
     df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
     df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
     df["alt"] = pd.to_numeric(df["alt"], errors="coerce")
+    df["ground_factor"] = pd.to_numeric(
+        df["ground_factor"],
+        errors="coerce",
+    )
 
     df = df.dropna(subset=[
         "x_epsg5179",
@@ -65,6 +87,26 @@ def read_receiver_csv(csv_path, receiver_type):
         "lon",
         "alt",
     ]).copy()
+
+    if receiver_type == "terrain":
+        missing_ground_factor = df["ground_factor"].isna()
+        invalid_ground_factor = ~df["ground_factor"].between(0.0, 1.0)
+        invalid_count = int(
+            (missing_ground_factor | invalid_ground_factor).sum()
+        )
+        if invalid_count > 0:
+            raise ValueError(
+                f"{csv_path} 지면계수 누락 또는 범위 오류: {invalid_count}개"
+            )
+    else:
+        missing_building_id = (
+            df["building_id"].isna()
+            | df["building_id"].astype("string").str.strip().eq("")
+        )
+        if missing_building_id.any():
+            raise ValueError(
+                f"{csv_path} 건물 ID 누락: {int(missing_building_id.sum())}개"
+            )
 
     return df
 
@@ -332,7 +374,8 @@ merged = assign_receiver_id(merged)
 # =========================
 output_cols = [
     "receiver_id",
-    "reference",
+    "building_id",
+    "ground_factor",
     "type",
     "big_grid_id",
     "big_grid_order",

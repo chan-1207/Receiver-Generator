@@ -178,7 +178,7 @@ def is_blocked_by_other_building(receiver_row, conflict_gdf, sindex):
     높은 건물의 상부 수음점은 유지
     """
     p = receiver_row.geometry
-    my_id = receiver_row["reference"]
+    my_id = receiver_row["building_id"]
     alt = receiver_row["alt"]
 
     candidate_idx = list(sindex.query(p, predicate="intersects"))
@@ -276,7 +276,7 @@ for idx, row in buf.iterrows():
     if geom is None or geom.is_empty:
         continue
 
-    reference = row[id_col]
+    building_id = row[id_col]
 
     base = float(row[base_col])
     top = float(row[top_col])
@@ -306,7 +306,7 @@ for idx, row in buf.iterrows():
             receiver_count += 1
 
             records.append({
-                "reference": reference,
+                "building_id": building_id,
                 "x_epsg5179": x,
                 "y_epsg5179": y,
                 "lat": lat,
@@ -346,7 +346,7 @@ print("final receivers count:", len(filtered))
 # CSV 저장
 # =========================
 output_cols = [
-    "reference",
+    "building_id",
     "x_epsg5179",
     "y_epsg5179",
     "lat",

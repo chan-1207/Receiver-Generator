@@ -15,7 +15,7 @@ project_dir = Path(__file__).resolve().parents[1]
 
 input_building_height_gpkg_path = Path(os.environ.get(
     "BUILDING_HEIGHT_INPUT_GPKG",
-    project_dir / "data/building_height/building_cropped_height.gpkg",
+    project_dir / "data/building_height/cropped_building_height.gpkg",
 ))
 input_building_register_csv_path = Path(os.environ.get(
     "BUILDING_REGISTER_INPUT_CSV",
