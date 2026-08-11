@@ -8,6 +8,7 @@ dependencies = [
     "pandas>=3.0.3",
     "pandas-stubs~=3.0.3",
     "pyproj>=3.7.2",
+    "rasterio>=1.5.1",
     "scipy>=1.18.0",
     "shapely>=2.1.2",
 ]

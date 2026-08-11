@@ -23,9 +23,6 @@ building_metadata_gpkg_path = (
 building_metadata_csv_path = (
     project_dir / "metadata/building/building_metadata.csv"
 )
-building_raw_mapping_csv_path = (
-    project_dir / "config/building_raw_mapping.csv"
-)
 building_buffer_path = (
     project_dir / "receivers/building/building_buffers_10m.gpkg"
 )
@@ -38,6 +35,7 @@ roof_receiver_path = (
 terrain_receiver_path = (
     project_dir / "receivers/terrain/terrain_receivers_center.csv"
 )
+terrain_dem_path = project_dir / "metadata/terrain/terrain_dem.tif"
 merged_receiver_path = project_dir / "receivers/merged_receivers.csv"
 
 
@@ -49,6 +47,7 @@ pipeline = [
     ("건물 벽면 버퍼 생성", "scripts/generate_building_wall_buffers.py"),
     ("건물 벽면 수음점 생성", "scripts/generate_building_wall_receivers.py"),
     ("건물 지붕 수음점 생성", "scripts/generate_building_roof_receivers.py"),
+    ("지형 DEM 생성", "scripts/generate_terrain_dem.py"),
     ("지면 수음점 생성", "scripts/generate_terrain_receivers.py"),
     ("수음점 병합", "scripts/merge_receivers.py"),
 ]
@@ -72,16 +71,17 @@ def make_environment(settings):
         "RECEIVER_RESOLUTION_M": str(settings["resolution_m"]),
         "GRID_SIZE_M": str(settings["grid_size_m"]),
         "BUILDING_HEIGHT_INPUT_GPKG": str(input_files["building_height_gpkg"]),
-        "BUILDING_REGISTER_INPUT_CSV": str(input_files["building_register_csv"]),
         "BUILDING_ORIGINAL_INPUT_GPKG": str(input_files["building_height_gpkg"]),
         "TERRAIN_CONTOUR_INPUT_SHP": str(input_files["terrain_contour_shp"]),
+        "TERRAIN_DEM_OUTPUT_TIF": str(terrain_dem_path),
+        "TERRAIN_DEM_INPUT_TIF": str(terrain_dem_path),
+        "TERRAIN_DEM_RESOLUTION_M": str(settings["resolution_m"]),
         "LAND_COVER_INPUT_GPKG": str(input_files["land_cover_gpkg"]),
         "GROUND_FACTOR_MAPPING_CSV": str(
             input_files["ground_factor_mapping_csv"]
         ),
         "BUILDING_METADATA_OUTPUT_GPKG": str(building_metadata_gpkg_path),
         "BUILDING_METADATA_OUTPUT_CSV": str(building_metadata_csv_path),
-        "BUILDING_RAW_MAPPING_OUTPUT_CSV": str(building_raw_mapping_csv_path),
         "BUILDING_METADATA_INPUT_GPKG": str(building_metadata_gpkg_path),
         "RECEIVER_BUFFER_OUTPUT_GPKG": str(building_buffer_path),
         "RECEIVER_BUFFER_INPUT_GPKG": str(building_buffer_path),

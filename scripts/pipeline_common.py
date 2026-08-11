@@ -18,18 +18,13 @@ NUMERIC_SETTING_KEYS = [
 
 INPUT_FILE_KEYS = [
     "building_height_gpkg",
-    "building_register_csv",
     "terrain_contour_shp",
     "land_cover_gpkg",
     "ground_factor_mapping_csv",
 ]
 
-OPTIONAL_INPUT_FILE_KEYS = {
-    "building_register_csv",
-}
-
 RECEIVER_CRS = "EPSG:5179"
-TERRAIN_INTERPOLATION_PADDING_M = 800.0
+TERRAIN_DEM_SOURCE_PADDING_M = 2000.0
 
 
 def get_env_path(name, default):
@@ -211,10 +206,10 @@ def validate_pipeline_spatial_coverage(settings):
         settings["max_y"],
     )
     terrain_bounds = (
-        settings["min_x"] - TERRAIN_INTERPOLATION_PADDING_M,
-        settings["min_y"] - TERRAIN_INTERPOLATION_PADDING_M,
-        settings["max_x"] + TERRAIN_INTERPOLATION_PADDING_M,
-        settings["max_y"] + TERRAIN_INTERPOLATION_PADDING_M,
+        settings["min_x"] - TERRAIN_DEM_SOURCE_PADDING_M,
+        settings["min_y"] - TERRAIN_DEM_SOURCE_PADDING_M,
+        settings["max_x"] + TERRAIN_DEM_SOURCE_PADDING_M,
+        settings["max_y"] + TERRAIN_DEM_SOURCE_PADDING_M,
     )
     input_files = settings["input_files"]
     specifications = [
@@ -300,11 +295,7 @@ def load_pipeline_settings(config_path, project_dir):
     }
 
     validate_grid_settings(settings)
-    validate_input_paths(
-        path
-        for key, path in settings["input_files"].items()
-        if key not in OPTIONAL_INPUT_FILE_KEYS
-    )
+    validate_input_paths(settings["input_files"].values())
     validate_pipeline_spatial_coverage(settings)
 
     return settings

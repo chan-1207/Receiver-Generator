@@ -4,16 +4,15 @@ import geopandas as gpd
 import pandas as pd
 import numpy as np
 import pyogrio
+import rasterio
 import shapely
 
 from pyproj import Transformer
-from scipy.spatial import cKDTree
-from shapely.geometry import LineString, MultiLineString, box
+from shapely.geometry import box
 from shapely.strtree import STRtree
 
 try:
     from scripts.pipeline_common import (
-        TERRAIN_INTERPOLATION_PADDING_M,
         get_env_float,
         get_env_path,
         validate_bounds,
@@ -23,7 +22,6 @@ try:
     )
 except ModuleNotFoundError:
     from pipeline_common import (
-        TERRAIN_INTERPOLATION_PADDING_M,
         get_env_float,
         get_env_path,
         validate_bounds,
@@ -38,9 +36,9 @@ except ModuleNotFoundError:
 # =========================
 project_dir = Path(__file__).resolve().parents[1]
 
-input_contour_path = get_env_path(
-    "TERRAIN_CONTOUR_INPUT_SHP",
-    project_dir / "data/terrain/terrain.shp",
+input_dem_path = get_env_path(
+    "TERRAIN_DEM_INPUT_TIF",
+    project_dir / "metadata/terrain/terrain_dem.tif",
 )
 input_land_cover_path = get_env_path(
     "LAND_COVER_INPUT_GPKG",
@@ -55,11 +53,11 @@ output_csv_path = get_env_path(
     project_dir / "receivers/terrain/cropped_terrain_receivers_center.csv",
 )
 
-elev_field = "CONT"
 land_cover_layer_name = "land_cover_map"
 land_cover_code_field = "L2_CODE"
 receiver_crs = "EPSG:5179"
 coverage_tolerance = 1.0e-4
+spatial_epsilon = 1.0e-6
 
 grid_m = get_env_float("RECEIVER_RESOLUTION_M", 10.0)
 
@@ -70,12 +68,7 @@ max_y = get_env_float("RECEIVER_MAX_Y", 1733000)
 
 receiver_height_m = 1.5
 
-idw_power = 2.0
-idw_radius_m = TERRAIN_INTERPOLATION_PADDING_M
-idw_k = 32
-eps = 1e-6
 spatial_chunk_size = 100_000
-idw_chunk_size = 100_000
 
 save_debug_grid = False
 debug_grid_csv_path = project_dir / "receivers/terrain/debug_grid_10m.csv"
@@ -114,144 +107,6 @@ def make_grid():
         "lat": lat,
         "lon": lon,
     })
-
-
-# =========================
-# 등고선 읽기 함수
-# =========================
-def read_contour_vertices(contour_path):
-    search_distance_m = idw_radius_m + grid_m
-    gdf = gpd.read_file(
-        contour_path,
-        bbox=(
-            min_x - search_distance_m,
-            min_y - search_distance_m,
-            max_x + search_distance_m,
-            max_y + search_distance_m,
-        ),
-    )
-
-    print("[입력 등고선]")
-    print(" - path:", contour_path)
-    print(" - rows:", len(gdf))
-    print(" - crs:", gdf.crs)
-    print(" - columns:", list(gdf.columns))
-
-    if gdf.crs is None:
-        raise ValueError("등고선 SHP에 CRS가 없습니다.")
-
-    if gdf.crs.to_epsg() != 5179:
-        gdf = gdf.to_crs(5179)
-
-    if elev_field not in gdf.columns:
-        raise ValueError(f"고도 필드가 없습니다: {elev_field}")
-
-    xs_list = []
-    ys_list = []
-    zs_list = []
-
-    for _, row in gdf.iterrows():
-        geom = row.geometry
-
-        if geom is None or geom.is_empty:
-            continue
-
-        try:
-            z = float(row[elev_field])
-        except Exception:
-            continue
-
-        if isinstance(geom, LineString):
-            lines = [geom]
-        elif isinstance(geom, MultiLineString):
-            lines = list(geom.geoms)
-        else:
-            continue
-
-        for line in lines:
-            coords = np.asarray(line.coords)
-
-            if len(coords) < 2:
-                continue
-
-            xs_list.append(coords[:, 0])
-            ys_list.append(coords[:, 1])
-            zs_list.append(np.full(len(coords), z, dtype=float))
-
-    if len(xs_list) == 0:
-        raise ValueError("등고선 vertex를 읽지 못했습니다.")
-
-    terrain_x = np.concatenate(xs_list)
-    terrain_y = np.concatenate(ys_list)
-    terrain_z = np.concatenate(zs_list)
-
-    print("[등고선 vertex]")
-    print(" - count:", len(terrain_x))
-    print(" - z min:", np.nanmin(terrain_z))
-    print(" - z max:", np.nanmax(terrain_z))
-
-    return terrain_x, terrain_y, terrain_z
-
-
-# =========================
-# IDW 보간 함수
-# =========================
-def calc_ground_z(terrain_x, terrain_y, terrain_z, recv_x, recv_y):
-    tree = cKDTree(np.column_stack([terrain_x, terrain_y]))
-    ground_z = np.full(len(recv_x), np.nan, dtype=float)
-    chunk_count = int(np.ceil(len(recv_x) / idw_chunk_size))
-
-    print("[지형고도 IDW]")
-    print(" - receiver count:", len(recv_x))
-    print(" - chunk size:", idw_chunk_size)
-
-    for chunk_no, start in enumerate(
-        range(0, len(recv_x), idw_chunk_size),
-        start=1,
-    ):
-        end = min(start + idw_chunk_size, len(recv_x))
-        recv_xy = np.column_stack([
-            recv_x[start:end],
-            recv_y[start:end],
-        ])
-
-        try:
-            dist, idx = tree.query(
-                recv_xy,
-                k=idw_k,
-                distance_upper_bound=idw_radius_m,
-                workers=-1,
-            )
-        except TypeError:
-            dist, idx = tree.query(
-                recv_xy,
-                k=idw_k,
-                distance_upper_bound=idw_radius_m,
-            )
-
-        if dist.ndim == 1:
-            dist = dist[:, None]
-            idx = idx[:, None]
-
-        valid = np.isfinite(dist) & (idx < len(terrain_z))
-        dist_safe = np.maximum(dist, eps)
-        weight = np.zeros_like(dist_safe, dtype=float)
-        weight[valid] = 1.0 / (dist_safe[valid] ** idw_power)
-        weight_sum = np.sum(weight, axis=1)
-        idx_safe = np.clip(idx, 0, len(terrain_z) - 1)
-        z_sum = np.sum(weight * terrain_z[idx_safe], axis=1)
-        valid_weight = weight_sum > 0
-        chunk_ground_z = ground_z[start:end]
-        chunk_ground_z[valid_weight] = (
-            z_sum[valid_weight] / weight_sum[valid_weight]
-        )
-
-        print(
-            f" - chunk {chunk_no}/{chunk_count}: "
-            f"{end:,}/{len(recv_x):,}"
-        )
-
-    return ground_z
 
 
 # =========================
@@ -542,7 +397,7 @@ def assign_ground_factor(grid_df):
         )
         near_boundary = (
             center_boundary_distance
-            <= boundary_search_distance + eps
+            <= boundary_search_distance + spatial_epsilon
         )
         exact_required[
             center_single_cell_ids[near_boundary]
@@ -722,36 +577,103 @@ def assign_ground_factor(grid_df):
 
 
 # =========================
+# DEM 고도 추출 함수
+# =========================
+def read_dem_ground_z(dem_path, grid_df):
+    recv_x = grid_df["x_epsg5179"].to_numpy(dtype=float)
+    recv_y = grid_df["y_epsg5179"].to_numpy(dtype=float)
+
+    with rasterio.open(dem_path) as dataset:
+        if dataset.crs is None:
+            raise ValueError(f"DEM CRS가 없습니다: {dem_path}")
+        if dataset.crs.to_epsg() != 5179:
+            raise ValueError(
+                "DEM 좌표계는 EPSG:5179여야 합니다: "
+                f"{dataset.crs}"
+            )
+        if not np.isclose(dataset.transform.b, 0.0) or not np.isclose(
+            dataset.transform.d,
+            0.0,
+        ):
+            raise ValueError("회전된 DEM 격자는 지원하지 않습니다.")
+
+        pixel_width = abs(dataset.transform.a)
+        pixel_height = abs(dataset.transform.e)
+        if not np.isclose(pixel_width, grid_m) or not np.isclose(
+            pixel_height,
+            grid_m,
+        ):
+            raise ValueError(
+                "DEM 해상도와 수음점 해상도가 다릅니다: "
+                f"DEM={pixel_width}x{pixel_height}m, "
+                f"수음점={grid_m}m"
+            )
+
+        bounds = dataset.bounds
+        tolerance = max(pixel_width, pixel_height) * 1.0e-6
+        if (
+            bounds.left > min_x + tolerance
+            or bounds.right < max_x - tolerance
+            or bounds.bottom > min_y + tolerance
+            or bounds.top < max_y - tolerance
+        ):
+            raise ValueError(
+                "DEM이 계산 영역 전체를 포함하지 않습니다.\n"
+                f"DEM: X={bounds.left:.1f}~{bounds.right:.1f}, "
+                f"Y={bounds.bottom:.1f}~{bounds.top:.1f}\n"
+                f"영역: X={min_x:.1f}~{max_x:.1f}, "
+                f"Y={min_y:.1f}~{max_y:.1f}"
+            )
+
+        columns = np.floor(
+            (recv_x - dataset.transform.c) / pixel_width
+        ).astype(np.int64)
+        rows = np.floor(
+            (dataset.transform.f - recv_y) / pixel_height
+        ).astype(np.int64)
+        inside = (
+            (rows >= 0)
+            & (rows < dataset.height)
+            & (columns >= 0)
+            & (columns < dataset.width)
+        )
+        if not inside.all():
+            raise ValueError(
+                "DEM 바깥에 위치한 지면 수음점이 있습니다: "
+                f"{int((~inside).sum()):,}개"
+            )
+
+        dem = dataset.read(1, masked=True)
+        sampled = dem[rows, columns]
+        ground_z = np.asarray(sampled.filled(np.nan), dtype=float)
+
+        print("[DEM 지면고도]")
+        print(" - path:", dem_path)
+        print(" - crs:", dataset.crs)
+        print(" - resolution:", pixel_width, "m")
+        print(" - receivers:", len(ground_z))
+
+    missing_mask = ~np.isfinite(ground_z)
+    if missing_mask.any():
+        missing_grid = grid_df.loc[
+            missing_mask,
+            ["x_epsg5179", "y_epsg5179"],
+        ].head(10)
+        raise ValueError(
+            "DEM 고도가 없는 지면 수음점이 있습니다.\n"
+            f"누락 수음점 수: {int(missing_mask.sum()):,}\n"
+            f"예시 좌표:\n{missing_grid.to_string(index=False)}"
+        )
+
+    return ground_z
+
+
+# =========================
 # 수음점 생성 함수
 # =========================
 def make_terrain_receivers():
     grid_df = assign_ground_factor(make_grid())
-
-    recv_x = grid_df["x_epsg5179"].to_numpy(dtype=float)
-    recv_y = grid_df["y_epsg5179"].to_numpy(dtype=float)
-
-    terrain_x, terrain_y, terrain_z = read_contour_vertices(input_contour_path)
-
-    ground_z = calc_ground_z(
-        terrain_x=terrain_x,
-        terrain_y=terrain_y,
-        terrain_z=terrain_z,
-        recv_x=recv_x,
-        recv_y=recv_y
-    )
-
-    missing_ground_mask = ~np.isfinite(ground_z)
-    if missing_ground_mask.any():
-        missing_grid = grid_df.loc[
-            missing_ground_mask,
-            ["x_epsg5179", "y_epsg5179"],
-        ].head(10)
-        raise ValueError(
-            "등고선 고도 보간에 실패한 지면 수음점이 있습니다.\n"
-            f"실패 수음점 수: {int(missing_ground_mask.sum())}\n"
-            f"IDW 탐색 반경: {idw_radius_m:.1f}m\n"
-            f"예시 좌표:\n{missing_grid.to_string(index=False)}"
-        )
+    ground_z = read_dem_ground_z(input_dem_path, grid_df)
 
     receivers = grid_df.copy()
     receivers["ground_alt"] = ground_z
@@ -764,27 +686,16 @@ def main():
     validate_bounds(min_x, max_x, min_y, max_y)
     validate_positive(grid_m, "지면 수음점 해상도")
     validate_input_paths([
-        input_contour_path,
+        input_dem_path,
         input_land_cover_path,
         ground_factor_mapping_path,
     ])
     area_bounds = (min_x, min_y, max_x, max_y)
-    terrain_bounds = (
-        min_x - idw_radius_m,
-        min_y - idw_radius_m,
-        max_x + idw_radius_m,
-        max_y + idw_radius_m,
-    )
     validate_spatial_file_coverage(
         path=input_land_cover_path,
         label="토지피복도",
         required_bounds=area_bounds,
         layer=land_cover_layer_name,
-    )
-    validate_spatial_file_coverage(
-        path=input_contour_path,
-        label="등고선",
-        required_bounds=terrain_bounds,
     )
     output_csv_path.parent.mkdir(parents=True, exist_ok=True)
 
