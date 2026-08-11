@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 
 import geopandas as gpd
@@ -8,19 +7,36 @@ from shapely.geometry import LineString, Point
 from shapely.validation import make_valid
 from pyproj import Transformer
 
+try:
+    from scripts.pipeline_common import (
+        get_env_float,
+        get_env_path,
+        validate_bounds,
+        validate_input_paths,
+        validate_positive,
+    )
+except ModuleNotFoundError:
+    from pipeline_common import (
+        get_env_float,
+        get_env_path,
+        validate_bounds,
+        validate_input_paths,
+        validate_positive,
+    )
+
 # =========================
 # 설정값
 # =========================
 project_dir = Path(__file__).resolve().parents[1]
 
-input_polygon_gpkg_path = Path(os.environ.get(
+input_polygon_gpkg_path = get_env_path(
     "RECEIVER_BUFFER_INPUT_GPKG",
     project_dir / "receivers/building/cropped_building_buffers_10m.gpkg",
-))
-output_cvs_path = Path(os.environ.get(
+)
+output_csv_path = get_env_path(
     "WALL_RECEIVER_OUTPUT_CSV",
     project_dir / "receivers/building/cropped_building_receivers.csv",
-))
+)
 
 input_layer_name = "building_buffer"
 
@@ -28,19 +44,17 @@ id_col = "NF_ID"
 base_col = "BLDH_MN"   # 건물 지반 절대고도
 top_col = "BLDH_BV"    # 건물 기본/지붕 절대고도
 
-wall_resolution_m = 10.0
-vertical_resolution_m = 10.0
+wall_resolution_m = get_env_float("RECEIVER_RESOLUTION_M", 10.0)
+vertical_resolution_m = get_env_float("RECEIVER_RESOLUTION_M", 10.0)
 start_height_m = 1.5
 min_building_height_m = 1.5
 
-min_x = 1163000
-max_x = 1164000
-min_y = 1732000
-max_y = 1733000
+min_x = get_env_float("RECEIVER_MIN_X", 1163000)
+max_x = get_env_float("RECEIVER_MAX_X", 1164000)
+min_y = get_env_float("RECEIVER_MIN_Y", 1732000)
+max_y = get_env_float("RECEIVER_MAX_Y", 1733000)
 
 z_tolerance_m = 0.05
-
-output_cvs_path.parent.mkdir(parents=True, exist_ok=True)
 
 # =========================
 # 보조 함수
@@ -133,7 +147,7 @@ def get_exterior_receiver_points(geom, resolution: float):
     points = []
     seen_xy = set()
 
-    for segment in get_exterior_segments(geom):
+    for edge_no, segment in enumerate(get_exterior_segments(geom), start=1):
         for point in interpolate_points_on_line(segment, resolution):
             xy = (point.x, point.y)
 
@@ -141,7 +155,7 @@ def get_exterior_receiver_points(geom, resolution: float):
                 continue
 
             seen_xy.add(xy)
-            points.append(point)
+            points.append((point, edge_no))
 
     return points
 
@@ -210,153 +224,166 @@ def is_blocked_by_other_building(receiver_row, conflict_gdf, sindex):
     return False
 
 
-# =========================
-# 버퍼 폴리곤 로드
-# =========================
-if input_layer_name:
-    buf = gpd.read_file(input_polygon_gpkg_path, layer=input_layer_name)
-else:
-    buf = gpd.read_file(input_polygon_gpkg_path)
+def main():
+    validate_bounds(min_x, max_x, min_y, max_y)
+    validate_positive(wall_resolution_m, "벽면 수음점 수평 해상도")
+    validate_positive(vertical_resolution_m, "벽면 수음점 수직 해상도")
+    validate_input_paths([input_polygon_gpkg_path])
+    output_csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-print("CRS:", buf.crs)
-print("buffer feature count:", len(buf))
+    # =========================
+    # 버퍼 폴리곤 로드
+    # =========================
+    if input_layer_name:
+        buf = gpd.read_file(input_polygon_gpkg_path, layer=input_layer_name)
+    else:
+        buf = gpd.read_file(input_polygon_gpkg_path)
 
-if buf.crs is None:
-    raise ValueError("버퍼 GPKG의 CRS가 없습니다.")
+    print("CRS:", buf.crs)
+    print("buffer feature count:", len(buf))
 
-# 필수 필드 확인
-required_cols = [id_col, base_col, top_col]
-missing = [c for c in required_cols if c not in buf.columns]
+    if buf.crs is None:
+        raise ValueError("버퍼 GPKG의 CRS가 없습니다.")
 
-if missing:
-    raise ValueError(f"버퍼 레이어에 필수 필드가 없습니다: {missing}")
+    # 필수 필드 확인
+    required_cols = [id_col, base_col, top_col]
+    missing = [c for c in required_cols if c not in buf.columns]
 
-# =========================
-# 데이터 정리
-# =========================
-buf = buf[buf.geometry.notnull()].copy()
-buf["geometry"] = buf.geometry.apply(clean_geom)
-buf = buf[buf.geometry.notnull()].copy()
-buf = buf[~buf.geometry.is_empty].copy()
+    if missing:
+        raise ValueError(f"버퍼 레이어에 필수 필드가 없습니다: {missing}")
 
-buf[base_col] = pd.to_numeric(buf[base_col], errors="coerce")
-buf[top_col] = pd.to_numeric(buf[top_col], errors="coerce")
+    # =========================
+    # 데이터 정리
+    # =========================
+    buf = buf[buf.geometry.notnull()].copy()
+    buf["geometry"] = buf.geometry.apply(clean_geom)
+    buf = buf[buf.geometry.notnull()].copy()
+    buf = buf[~buf.geometry.is_empty].copy()
 
-buf = buf[
-    buf[id_col].notna() &
-    buf[base_col].notna() &
-    buf[top_col].notna()
-].copy()
+    buf[base_col] = pd.to_numeric(buf[base_col], errors="coerce")
+    buf[top_col] = pd.to_numeric(buf[top_col], errors="coerce")
 
-buf["building_height"] = buf[top_col] - buf[base_col]
+    buf = buf[
+        buf[id_col].notna() &
+        buf[base_col].notna() &
+        buf[top_col].notna()
+    ].copy()
 
-buf = buf[
-    buf["building_height"] >= min_building_height_m
-].copy()
+    buf["building_height"] = buf[top_col] - buf[base_col]
 
-buf = buf.reset_index(drop=True)
+    buf = buf[
+        buf["building_height"] >= min_building_height_m
+    ].copy()
 
-print("valid buffer count:", len(buf))
+    buf = buf.reset_index(drop=True)
 
-# =========================
-# 좌표 변환기
-# =========================
-transformer = Transformer.from_crs(buf.crs, "EPSG:4326", always_xy=True)
+    print("valid buffer count:", len(buf))
 
-# =========================
-# 수음점 후보 생성
-# =========================
-records = []
-receiver_count = 0
-outside_xy_count = 0
+    # =========================
+    # 좌표 변환기
+    # =========================
+    transformer = Transformer.from_crs(buf.crs, "EPSG:4326", always_xy=True)
 
-for idx, row in buf.iterrows():
-    geom = row.geometry
+    # =========================
+    # 수음점 후보 생성
+    # =========================
+    records = []
+    receiver_count = 0
+    outside_xy_count = 0
 
-    if geom is None or geom.is_empty:
-        continue
+    for idx, row in buf.iterrows():
+        geom = row.geometry
 
-    building_id = row[id_col]
-
-    base = float(row[base_col])
-    top = float(row[top_col])
-    building_h = float(row["building_height"])
-
-    heights = make_vertical_heights(building_h)
-
-    if len(heights) == 0:
-        continue
-
-    # 이미 만들어둔 버퍼 폴리곤 외곽선 기준
-    wall_points = get_exterior_receiver_points(geom, wall_resolution_m)
-
-    for pt in wall_points:
-        x, y = pt.x, pt.y
-
-        # 대상지역 외부 XY 후보 제외
-        if not (min_x <= x <= max_x and min_y <= y <= max_y):
-            outside_xy_count += 1
+        if geom is None or geom.is_empty:
             continue
 
-        lon, lat = transformer.transform(x, y)
+        building_id = row[id_col]
 
-        for h in heights:
-            alt = base + float(h)
+        base = float(row[base_col])
+        top = float(row[top_col])
+        building_h = float(row["building_height"])
 
-            receiver_count += 1
+        heights = make_vertical_heights(building_h)
 
-            records.append({
-                "building_id": building_id,
-                "x_epsg5179": x,
-                "y_epsg5179": y,
-                "lat": lat,
-                "lon": lon,
-                "alt": alt,
-                "geometry": Point(x, y)
-            })
+        if len(heights) == 0:
+            continue
 
-receivers = gpd.GeoDataFrame(records, geometry="geometry", crs=buf.crs)
+        # 이미 만들어둔 버퍼 폴리곤 외곽선 기준
+        wall_points = get_exterior_receiver_points(geom, wall_resolution_m)
 
-print("candidate receivers count:", len(receivers))
-print("outside XY candidate count:", outside_xy_count)
+        for pt, edge_no in wall_points:
+            x, y = pt.x, pt.y
 
-if len(receivers) == 0:
-    raise ValueError("생성된 수음점이 없습니다. 버퍼 폴리곤과 높이 필드를 확인하세요.")
+            # 대상지역 외부 XY 후보 제외
+            if not (min_x <= x <= max_x and min_y <= y <= max_y):
+                outside_xy_count += 1
+                continue
 
-# =========================
-# 3D 높이 기반 겹침 필터링
-# =========================
-# 같은 버퍼 레이어를 충돌 판단용으로 사용
-conflict_gdf = buf[[id_col, top_col, "geometry"]].copy()
-conflict_gdf = gpd.GeoDataFrame(conflict_gdf, geometry="geometry", crs=buf.crs)
+            lon, lat = transformer.transform(x, y)
 
-sindex = conflict_gdf.sindex
+            for h in heights:
+                alt = base + float(h)
 
-receivers["is_blocked"] = receivers.apply(
-    lambda r: is_blocked_by_other_building(r, conflict_gdf, sindex),
-    axis=1
-)
+                receiver_count += 1
 
-filtered = receivers[~receivers["is_blocked"]].copy()
+                records.append({
+                    "building_id": building_id,
+                    "edge_no": edge_no,
+                    "x_epsg5179": x,
+                    "y_epsg5179": y,
+                    "lat": lat,
+                    "lon": lon,
+                    "alt": alt,
+                    "geometry": Point(x, y)
+                })
 
-print("blocked receivers count:", int(receivers["is_blocked"].sum()))
-print("final receivers count:", len(filtered))
+    receivers = gpd.GeoDataFrame(records, geometry="geometry", crs=buf.crs)
 
-# =========================
-# CSV 저장
-# =========================
-output_cols = [
-    "building_id",
-    "x_epsg5179",
-    "y_epsg5179",
-    "lat",
-    "lon",
-    "alt",
-]
+    print("candidate receivers count:", len(receivers))
+    print("outside XY candidate count:", outside_xy_count)
 
-out_df = filtered[output_cols].copy()
-out_df.to_csv(output_cvs_path, index=False, encoding="utf-8-sig")
+    if len(receivers) == 0:
+        raise ValueError("생성된 수음점이 없습니다. 버퍼 폴리곤과 높이 필드를 확인하세요.")
 
-print(f"saved: {output_cvs_path}")
-print(f"receivers count: {len(out_df)}")
-print(out_df.head())
+    # =========================
+    # 3D 높이 기반 겹침 필터링
+    # =========================
+    # 같은 버퍼 레이어를 충돌 판단용으로 사용
+    conflict_gdf = buf[[id_col, top_col, "geometry"]].copy()
+    conflict_gdf = gpd.GeoDataFrame(conflict_gdf, geometry="geometry", crs=buf.crs)
+
+    sindex = conflict_gdf.sindex
+
+    receivers["is_blocked"] = receivers.apply(
+        lambda r: is_blocked_by_other_building(r, conflict_gdf, sindex),
+        axis=1
+    )
+
+    filtered = receivers[~receivers["is_blocked"]].copy()
+
+    print("blocked receivers count:", int(receivers["is_blocked"].sum()))
+    print("final receivers count:", len(filtered))
+
+    # =========================
+    # CSV 저장
+    # =========================
+    output_cols = [
+        "building_id",
+        "edge_no",
+        "x_epsg5179",
+        "y_epsg5179",
+        "lat",
+        "lon",
+        "alt",
+    ]
+
+    out_df = filtered[output_cols].copy()
+    out_df.to_csv(output_csv_path, index=False, encoding="utf-8-sig")
+
+    print(f"saved: {output_csv_path}")
+    print(f"receivers count: {len(out_df)}")
+    print(out_df.head())
+
+
+if __name__ == "__main__":
+    main()

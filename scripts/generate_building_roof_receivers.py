@@ -1,5 +1,4 @@
 import math
-import os
 from pathlib import Path
 
 import geopandas as gpd
@@ -11,27 +10,44 @@ from shapely.geometry import LineString, Point
 from shapely.ops import split
 from shapely.validation import make_valid
 
+try:
+    from scripts.pipeline_common import (
+        get_env_float,
+        get_env_path,
+        validate_bounds,
+        validate_input_paths,
+        validate_positive,
+    )
+except ModuleNotFoundError:
+    from pipeline_common import (
+        get_env_float,
+        get_env_path,
+        validate_bounds,
+        validate_input_paths,
+        validate_positive,
+    )
+
 
 # =========================
 # 설정값
 # =========================
 project_dir = Path(__file__).resolve().parents[1]
 
-input_building_buffer_gpkg_path = Path(os.environ.get(
+input_building_buffer_gpkg_path = get_env_path(
     "RECEIVER_BUFFER_INPUT_GPKG",
     project_dir / "receivers/building/cropped_building_buffers_10m.gpkg",
-))
-input_building_metadata_gpkg_path = Path(os.environ.get(
-    "BUILDING_METADATA_INPUT_GPKG",
-    project_dir / "metadata/building/building_cropped_metadata.gpkg",
-))
-output_csv_path = Path(os.environ.get(
+)
+input_original_building_gpkg_path = get_env_path(
+    "BUILDING_ORIGINAL_INPUT_GPKG",
+    project_dir / "data/building_height/building_height.gpkg",
+)
+output_csv_path = get_env_path(
     "ROOF_RECEIVER_OUTPUT_CSV",
     project_dir / "receivers/building/cropped_building_roof_receivers.csv",
-))
+)
 
 input_buffer_layer_name = "building_buffer"
-input_metadata_layer_name = "building_metadata"
+input_original_building_layer_name = "TN_BULD"
 
 id_col = "NF_ID"
 top_col = "BLDH_BV"
@@ -39,9 +55,14 @@ area_col = "Shape_Area"
 
 min_building_area_m2 = 25.0
 
-roof_resolution_m = 10.0
+roof_resolution_m = get_env_float("RECEIVER_RESOLUTION_M", 10.0)
 roof_inset_m = roof_resolution_m / 2
 roof_height_offset_m = 1.0
+
+min_x = get_env_float("RECEIVER_MIN_X", 1163000)
+max_x = get_env_float("RECEIVER_MAX_X", 1164000)
+min_y = get_env_float("RECEIVER_MIN_Y", 1732000)
+max_y = get_env_float("RECEIVER_MAX_Y", 1733000)
 
 rectangularity_threshold = 0.8
 max_split_depth = 5
@@ -508,16 +529,17 @@ def load_buildings():
         raise ValueError(f"건물 버퍼에 중복 ID가 있습니다: {duplicate_ids}")
 
     original_buildings = gpd.read_file(
-        input_building_metadata_gpkg_path,
-        layer=input_metadata_layer_name
+        input_original_building_gpkg_path,
+        layer=input_original_building_layer_name,
+        bbox=tuple(buildings.total_bounds),
     )
 
     if original_buildings.crs is None:
-        raise ValueError("건물 메타데이터 GPKG의 CRS가 없습니다.")
+        raise ValueError("원본 건물 GPKG의 CRS가 없습니다.")
 
     if id_col not in original_buildings.columns:
         raise ValueError(
-            f"건물 메타데이터 레이어에 ID 필드가 없습니다: {id_col}"
+            f"원본 건물 레이어에 ID 필드가 없습니다: {id_col}"
         )
 
     if original_buildings.crs != buildings.crs:
@@ -547,7 +569,7 @@ def load_buildings():
             duplicate_building_id_mask,
             id_col,
         ].head(5).tolist()
-        raise ValueError(f"건물 메타데이터에 중복 ID가 있습니다: {duplicate_ids}")
+        raise ValueError(f"원본 건물 레이어에 중복 ID가 있습니다: {duplicate_ids}")
 
     original_geometry_by_id = original_buildings.set_index(
         "_building_id_key"
@@ -564,7 +586,7 @@ def load_buildings():
 
     if missing_original_count > 0:
         raise ValueError(
-            "메타데이터 원본 형상을 찾지 못한 버퍼 건물이 있습니다: "
+            "원본 형상을 찾지 못한 버퍼 건물이 있습니다: "
             f"{missing_original_count}개"
         )
 
@@ -604,6 +626,10 @@ def generate_receivers(buildings, transformer):
 
         for point in points:
             x, y = point.x, point.y
+
+            if not (min_x <= x <= max_x and min_y <= y <= max_y):
+                continue
+
             lon, lat = transformer.transform(x, y)
 
             records.append({
@@ -646,6 +672,12 @@ def generate_receivers(buildings, transformer):
     print("saved:", output_csv_path)
 
 def main():
+    validate_bounds(min_x, max_x, min_y, max_y)
+    validate_positive(roof_resolution_m, "지붕 수음점 해상도")
+    validate_input_paths([
+        input_building_buffer_gpkg_path,
+        input_original_building_gpkg_path,
+    ])
     output_csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     buildings = load_buildings()
