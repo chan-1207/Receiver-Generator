@@ -31,7 +31,8 @@ DEFAULT_TERRAIN_IDW_SETTINGS = {
     "min_contours": 4,
     "max_contours": 8,
     "min_elevation_levels": 2,
-    "power": 2.0,
+    "workers": 8,
+    "chunk_size": 2000,
 }
 INVALID_FILENAME_CHARACTERS = '<>:"/\\|?*'
 
@@ -156,12 +157,14 @@ def load_terrain_idw_settings(raw_settings):
     idw_settings = DEFAULT_TERRAIN_IDW_SETTINGS.copy()
     idw_settings.update(raw_idw)
     try:
-        for name in ("search_radius_m", "max_search_radius_m", "power"):
+        for name in ("search_radius_m", "max_search_radius_m"):
             idw_settings[name] = float(idw_settings[name])
         for name in (
             "min_contours",
             "max_contours",
             "min_elevation_levels",
+            "workers",
+            "chunk_size",
         ):
             raw_value = idw_settings[name]
             numeric_value = float(raw_value)
@@ -170,7 +173,8 @@ def load_terrain_idw_settings(raw_settings):
             idw_settings[name] = int(numeric_value)
     except (TypeError, ValueError) as error:
         raise ValueError(
-            "terrain_idw의 반경·등고선 개수·가중 지수는 숫자여야 합니다."
+            "terrain_idw의 반경·등고선 개수·병렬 설정은 "
+            "숫자여야 합니다."
         ) from error
 
     validate_positive(idw_settings["search_radius_m"], "IDW 기준 반경")
@@ -184,7 +188,8 @@ def load_terrain_idw_settings(raw_settings):
         idw_settings["min_elevation_levels"],
         "IDW 최소 표고 단계 수",
     )
-    validate_positive(idw_settings["power"], "IDW 가중 지수")
+    validate_positive(idw_settings["workers"], "IDW 병렬 작업 수")
+    validate_positive(idw_settings["chunk_size"], "IDW 묶음 크기")
     if (
         idw_settings["search_radius_m"]
         > idw_settings["max_search_radius_m"]

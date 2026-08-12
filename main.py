@@ -115,7 +115,8 @@ def make_environment(settings, output_paths):
         "TERRAIN_IDW_MIN_ELEVATION_LEVELS": str(
             terrain_idw["min_elevation_levels"]
         ),
-        "TERRAIN_IDW_POWER": str(terrain_idw["power"]),
+        "TERRAIN_IDW_WORKERS": str(terrain_idw["workers"]),
+        "TERRAIN_IDW_CHUNK_SIZE": str(terrain_idw["chunk_size"]),
         "LAND_COVER_INPUT_GPKG": str(input_files["land_cover_gpkg"]),
         "GROUND_FACTOR_MAPPING_CSV": str(
             input_files["ground_factor_mapping_csv"]

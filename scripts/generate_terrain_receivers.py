@@ -1,4 +1,5 @@
 from pathlib import Path
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 import geopandas as gpd
 import pandas as pd
@@ -85,10 +86,14 @@ idw_min_elevation_levels = get_env_int(
     "TERRAIN_IDW_MIN_ELEVATION_LEVELS",
     2,
 )
-idw_power = get_env_float("TERRAIN_IDW_POWER", 2.0)
+idw_workers = get_env_int("TERRAIN_IDW_WORKERS", 8)
+contour_distance_chunk_size = get_env_int(
+    "TERRAIN_IDW_CHUNK_SIZE",
+    2_000,
+)
 idw_zero_distance_tolerance_m = 1.0e-9
+IDW_POWER = 2.0
 contour_simplify_tolerance_m = min(2.0, grid_m / 5.0)
-contour_distance_chunk_size = 2_000
 
 save_debug_grid = False
 debug_grid_csv_path = project_dir / "receivers/terrain/debug_grid_10m.csv"
@@ -765,7 +770,7 @@ def calculate_neighbor_idw(distance_matrix, elevation_matrix, receiver_xy):
     weights = np.zeros_like(distance_matrix, dtype=float)
     weighted_mask = valid_mask & ~exact_rows[:, None]
     weights[weighted_mask] = (
-        1.0 / distance_matrix[weighted_mask] ** idw_power
+        1.0 / distance_matrix[weighted_mask] ** IDW_POWER
     )
     ground_z = np.zeros(len(distance_matrix), dtype=float)
     weighted_rows = ~exact_rows
@@ -783,6 +788,174 @@ def calculate_neighbor_idw(distance_matrix, elevation_matrix, receiver_xy):
 
 
 # =========================
+# 등고선 IDW 묶음 계산 함수
+# =========================
+def calculate_contour_idw_chunk(
+    chunk_no,
+    start,
+    end,
+    recv_x,
+    recv_y,
+    contour_tree,
+    contours,
+    elevations,
+):
+    """단일 수음점 묶음의 IDW 계산 결과 반환"""
+    receiver_coordinates = np.column_stack([
+        recv_x[start:end],
+        recv_y[start:end],
+    ])
+    receiver_points = shapely.points(
+        receiver_coordinates[:, 0],
+        receiver_coordinates[:, 1],
+    )
+    distance_matrix, elevation_matrix = query_nearest_contours(
+        receiver_points,
+        contour_tree,
+        contours,
+        elevations,
+        idw_search_radius_m,
+    )
+    valid_mask = np.isfinite(distance_matrix)
+    contour_counts = valid_mask.sum(axis=1)
+    elevation_level_counts = count_elevation_levels(elevation_matrix)
+    exact_mask = valid_mask & (
+        distance_matrix <= idw_zero_distance_tolerance_m
+    )
+    exact_rows = exact_mask.any(axis=1)
+    fallback_rows = (~exact_rows) & (
+        (contour_counts < idw_min_contours)
+        | (elevation_level_counts < idw_min_elevation_levels)
+    )
+
+    if fallback_rows.any():
+        fallback_distances, fallback_elevations = query_nearest_contours(
+            receiver_points[fallback_rows],
+            contour_tree,
+            contours,
+            elevations,
+            idw_max_search_radius_m,
+        )
+        distance_matrix[fallback_rows] = fallback_distances
+        elevation_matrix[fallback_rows] = fallback_elevations
+        valid_mask = np.isfinite(distance_matrix)
+        contour_counts = valid_mask.sum(axis=1)
+        elevation_level_counts = count_elevation_levels(elevation_matrix)
+
+    insufficient_mask = (~exact_rows) & (
+        (contour_counts < idw_min_contours)
+        | (elevation_level_counts < idw_min_elevation_levels)
+    )
+    if insufficient_mask.any():
+        example_lines = []
+        for local_id in np.flatnonzero(insufficient_mask)[:10]:
+            global_id = start + local_id
+            example_lines.append(
+                f" - cell={global_id}, "
+                f"x={recv_x[global_id]:.3f}, "
+                f"y={recv_y[global_id]:.3f}, "
+                f"등고선={contour_counts[local_id]}, "
+                f"표고 단계={elevation_level_counts[local_id]}"
+            )
+        raise ValueError(
+            "IDW 최대 반경 안에서 최소 등고선 조건을 "
+            "충족하지 못했습니다.\n"
+            f"최대 반경: {idw_max_search_radius_m:.1f}m\n"
+            f"최소 등고선 개수: {idw_min_contours}\n"
+            f"최소 표고 단계 수: {idw_min_elevation_levels}\n"
+            f"실패 수음점 수: {int(insufficient_mask.sum()):,}\n"
+            + "\n".join(example_lines)
+        )
+
+    chunk_ground_z, exact_rows = calculate_neighbor_idw(
+        distance_matrix,
+        elevation_matrix,
+        receiver_coordinates,
+    )
+    effective_contour_counts = contour_counts.copy()
+    effective_level_counts = elevation_level_counts.copy()
+    effective_contour_counts[exact_rows] = 1
+    effective_level_counts[exact_rows] = 1
+    used_mask = valid_mask & ~exact_rows[:, None]
+    used_distances = distance_matrix[used_mask]
+    maximum_used_distance = (
+        float(used_distances.max())
+        if len(used_distances) > 0
+        else 0.0
+    )
+    return {
+        "chunk_no": chunk_no,
+        "start": start,
+        "end": end,
+        "ground_z": chunk_ground_z,
+        "fallback_count": int(fallback_rows.sum()),
+        "exact_count": int(exact_rows.sum()),
+        "selected_total": int(effective_contour_counts.sum()),
+        "selected_minimum": int(effective_contour_counts.min()),
+        "selected_maximum": int(effective_contour_counts.max()),
+        "level_total": int(effective_level_counts.sum()),
+        "level_minimum": int(effective_level_counts.min()),
+        "level_maximum": int(effective_level_counts.max()),
+        "maximum_used_distance": maximum_used_distance,
+    }
+
+
+# =========================
+# 병렬 IDW 묶음 실행 함수
+# =========================
+def iterate_contour_idw_chunks(
+    chunk_ranges,
+    recv_x,
+    recv_y,
+    contour_tree,
+    contours,
+    elevations,
+):
+    """설정된 작업 수에 따른 IDW 묶음 결과 반환"""
+    def calculate(chunk_range):
+        chunk_no, start, end = chunk_range
+        return calculate_contour_idw_chunk(
+            chunk_no,
+            start,
+            end,
+            recv_x,
+            recv_y,
+            contour_tree,
+            contours,
+            elevations,
+        )
+
+    if idw_workers == 1:
+        for chunk_range in chunk_ranges:
+            yield calculate(chunk_range)
+        return
+
+    chunk_iterator = iter(chunk_ranges)
+    with ThreadPoolExecutor(max_workers=idw_workers) as executor:
+        pending = {}
+        for _ in range(min(idw_workers, len(chunk_ranges))):
+            chunk_range = next(chunk_iterator)
+            pending[executor.submit(calculate, chunk_range)] = chunk_range
+
+        while pending:
+            completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                pending.pop(future)
+                try:
+                    yield future.result()
+                except Exception:
+                    for pending_future in pending:
+                        pending_future.cancel()
+                    raise
+
+                next_chunk_range = next(chunk_iterator, None)
+                if next_chunk_range is not None:
+                    pending[
+                        executor.submit(calculate, next_chunk_range)
+                    ] = next_chunk_range
+
+
+# =========================
 # 적응형 등고선 IDW 고도 계산 함수
 # =========================
 def calculate_contour_idw_ground_z(contours, elevations, grid_df):
@@ -791,7 +964,18 @@ def calculate_contour_idw_ground_z(contours, elevations, grid_df):
     recv_y = grid_df["y_epsg5179"].to_numpy(dtype=float)
     contour_tree = STRtree(contours)
     ground_z = np.full(len(grid_df), np.nan, dtype=float)
-    chunk_count = int(np.ceil(len(grid_df) / contour_distance_chunk_size))
+    chunk_ranges = [
+        (
+            chunk_no,
+            start,
+            min(start + contour_distance_chunk_size, len(grid_df)),
+        )
+        for chunk_no, start in enumerate(
+            range(0, len(grid_df), contour_distance_chunk_size),
+            start=1,
+        )
+    ]
+    chunk_count = len(chunk_ranges)
     fallback_receiver_count = 0
     exact_receiver_count = 0
     selected_contour_total = 0
@@ -801,6 +985,7 @@ def calculate_contour_idw_ground_z(contours, elevations, grid_df):
     elevation_level_minimum = idw_max_contours
     elevation_level_maximum = 0
     maximum_used_distance = 0.0
+    completed_receiver_count = 0
 
     print("[적응형 등고선 IDW 지면고도]")
     print(" - receivers:", len(grid_df))
@@ -809,119 +994,50 @@ def calculate_contour_idw_ground_z(contours, elevations, grid_df):
     print(" - minimum contours:", idw_min_contours)
     print(" - maximum contours:", idw_max_contours)
     print(" - minimum elevation levels:", idw_min_elevation_levels)
-    print(" - power:", idw_power)
+    print(" - power:", IDW_POWER)
+    print(" - workers:", idw_workers)
+    print(" - chunk size:", contour_distance_chunk_size)
 
-    for chunk_no, start in enumerate(
-        range(0, len(grid_df), contour_distance_chunk_size),
-        start=1,
-    ):
-        end = min(start + contour_distance_chunk_size, len(grid_df))
-        receiver_coordinates = np.column_stack([
-            recv_x[start:end],
-            recv_y[start:end],
-        ])
-        receiver_points = shapely.points(
-            receiver_coordinates[:, 0],
-            receiver_coordinates[:, 1],
-        )
-        distance_matrix, elevation_matrix = query_nearest_contours(
-            receiver_points,
-            contour_tree,
-            contours,
-            elevations,
-            idw_search_radius_m,
-        )
-        valid_mask = np.isfinite(distance_matrix)
-        contour_counts = valid_mask.sum(axis=1)
-        elevation_level_counts = count_elevation_levels(elevation_matrix)
-        exact_mask = valid_mask & (
-            distance_matrix <= idw_zero_distance_tolerance_m
-        )
-        exact_rows = exact_mask.any(axis=1)
-        fallback_rows = (~exact_rows) & (
-            (contour_counts < idw_min_contours)
-            | (elevation_level_counts < idw_min_elevation_levels)
-        )
-
-        if fallback_rows.any():
-            fallback_distances, fallback_elevations = query_nearest_contours(
-                receiver_points[fallback_rows],
-                contour_tree,
-                contours,
-                elevations,
-                idw_max_search_radius_m,
-            )
-            distance_matrix[fallback_rows] = fallback_distances
-            elevation_matrix[fallback_rows] = fallback_elevations
-            valid_mask = np.isfinite(distance_matrix)
-            contour_counts = valid_mask.sum(axis=1)
-            elevation_level_counts = count_elevation_levels(elevation_matrix)
-
-        insufficient_mask = (~exact_rows) & (
-            (contour_counts < idw_min_contours)
-            | (elevation_level_counts < idw_min_elevation_levels)
-        )
-        if insufficient_mask.any():
-            example_lines = []
-            for local_id in np.flatnonzero(insufficient_mask)[:10]:
-                global_id = start + local_id
-                example_lines.append(
-                    f" - cell={global_id}, "
-                    f"x={recv_x[global_id]:.3f}, "
-                    f"y={recv_y[global_id]:.3f}, "
-                    f"등고선={contour_counts[local_id]}, "
-                    f"표고 단계={elevation_level_counts[local_id]}"
-                )
-            raise ValueError(
-                "IDW 최대 반경 안에서 최소 등고선 조건을 "
-                "충족하지 못했습니다.\n"
-                f"최대 반경: {idw_max_search_radius_m:.1f}m\n"
-                f"최소 등고선 개수: {idw_min_contours}\n"
-                f"최소 표고 단계 수: {idw_min_elevation_levels}\n"
-                f"실패 수음점 수: {int(insufficient_mask.sum()):,}\n"
-                + "\n".join(example_lines)
-            )
-
-        chunk_ground_z, exact_rows = calculate_neighbor_idw(
-            distance_matrix,
-            elevation_matrix,
-            receiver_coordinates,
-        )
-        ground_z[start:end] = chunk_ground_z
-        effective_contour_counts = contour_counts.copy()
-        effective_level_counts = elevation_level_counts.copy()
-        effective_contour_counts[exact_rows] = 1
-        effective_level_counts[exact_rows] = 1
-        selected_contour_total += int(effective_contour_counts.sum())
+    chunk_results = iterate_contour_idw_chunks(
+        chunk_ranges,
+        recv_x,
+        recv_y,
+        contour_tree,
+        contours,
+        elevations,
+    )
+    for completed_chunk_count, result in enumerate(chunk_results, start=1):
+        start = result["start"]
+        end = result["end"]
+        ground_z[start:end] = result["ground_z"]
+        fallback_receiver_count += result["fallback_count"]
+        exact_receiver_count += result["exact_count"]
+        selected_contour_total += result["selected_total"]
         selected_contour_minimum = min(
             selected_contour_minimum,
-            int(effective_contour_counts.min()),
+            result["selected_minimum"],
         )
         selected_contour_maximum = max(
             selected_contour_maximum,
-            int(effective_contour_counts.max()),
+            result["selected_maximum"],
         )
-        elevation_level_total += int(effective_level_counts.sum())
+        elevation_level_total += result["level_total"]
         elevation_level_minimum = min(
             elevation_level_minimum,
-            int(effective_level_counts.min()),
+            result["level_minimum"],
         )
         elevation_level_maximum = max(
             elevation_level_maximum,
-            int(effective_level_counts.max()),
+            result["level_maximum"],
         )
-        used_mask = valid_mask & ~exact_rows[:, None]
-        used_distances = distance_matrix[used_mask]
-        if len(used_distances) > 0:
-            maximum_used_distance = max(
-                maximum_used_distance,
-                float(used_distances.max()),
-            )
-        fallback_receiver_count += int(fallback_rows.sum())
-        exact_receiver_count += int(exact_rows.sum())
+        maximum_used_distance = max(
+            maximum_used_distance,
+            result["maximum_used_distance"],
+        )
+        completed_receiver_count += end - start
         print(
-            f" - chunk {chunk_no}/{chunk_count}: "
-            f"{end:,}/{len(grid_df):,}"
+            f" - completed chunks {completed_chunk_count}/{chunk_count}: "
+            f"{completed_receiver_count:,}/{len(grid_df):,}"
         )
 
     if not np.isfinite(ground_z).all():
@@ -982,7 +1098,8 @@ def main():
         idw_min_elevation_levels,
         "IDW 최소 표고 단계 수",
     )
-    validate_positive(idw_power, "IDW 가중 지수")
+    validate_positive(idw_workers, "IDW 병렬 작업 수")
+    validate_positive(contour_distance_chunk_size, "IDW 묶음 크기")
     if idw_search_radius_m > idw_max_search_radius_m:
         raise ValueError("IDW 기준 반경은 최대 반경보다 클 수 없습니다.")
     if idw_min_contours > idw_max_contours:
