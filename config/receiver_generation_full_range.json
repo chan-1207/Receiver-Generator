@@ -5,6 +5,14 @@
   "max_y": 1740900,
   "resolution_m": 10.0,
   "grid_size_m": 100.0,
+  "terrain_idw": {
+    "search_radius_m": 800.0,
+    "max_search_radius_m": 2000.0,
+    "min_contours": 4,
+    "max_contours": 8,
+    "min_elevation_levels": 2,
+    "power": 2.0
+  },
   "output_filename": {
     "prefix": "",
     "suffix": ""

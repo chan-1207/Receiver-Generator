@@ -29,7 +29,6 @@ DEFAULT_OUTPUT_FILES = {
     "wall_receiver": "receivers/building/building_receivers.csv",
     "roof_receiver": "receivers/building/building_roof_receivers.csv",
     "terrain_receiver": "receivers/terrain/terrain_receivers_center.csv",
-    "terrain_dem": "metadata/terrain/terrain_dem.tif",
     "merged_receiver": "receivers/merged_receivers.csv",
 }
 BUILDING_INPUT_LAYER = "TN_BULD"
@@ -43,7 +42,6 @@ pipeline = [
     ("건물 벽면 버퍼 생성", "scripts/generate_building_wall_buffers.py", True),
     ("건물 벽면 수음점 생성", "scripts/generate_building_wall_receivers.py", True),
     ("건물 지붕 수음점 생성", "scripts/generate_building_roof_receivers.py", True),
-    ("지형 DEM 생성", "scripts/generate_terrain_dem.py", False),
     ("지면 수음점 생성", "scripts/generate_terrain_receivers.py", False),
     ("수음점 병합", "scripts/merge_receivers.py", False),
 ]
@@ -95,6 +93,7 @@ def make_output_paths(prefix="", suffix=""):
 def make_environment(settings, output_paths):
     """하위 스크립트 공통 환경변수 구성"""
     input_files = settings["input_files"]
+    terrain_idw = settings["terrain_idw"]
     env = os.environ.copy()
     env.update({
         "PYTHONUTF8": "1",
@@ -107,9 +106,16 @@ def make_environment(settings, output_paths):
         "BUILDING_HEIGHT_INPUT_GPKG": str(input_files["building_height_gpkg"]),
         "BUILDING_ORIGINAL_INPUT_GPKG": str(input_files["building_height_gpkg"]),
         "TERRAIN_CONTOUR_INPUT_SHP": str(input_files["terrain_contour_shp"]),
-        "TERRAIN_DEM_OUTPUT_TIF": str(output_paths["terrain_dem"]),
-        "TERRAIN_DEM_INPUT_TIF": str(output_paths["terrain_dem"]),
-        "TERRAIN_DEM_RESOLUTION_M": str(settings["resolution_m"]),
+        "TERRAIN_IDW_SEARCH_RADIUS_M": str(terrain_idw["search_radius_m"]),
+        "TERRAIN_IDW_MAX_SEARCH_RADIUS_M": str(
+            terrain_idw["max_search_radius_m"]
+        ),
+        "TERRAIN_IDW_MIN_CONTOURS": str(terrain_idw["min_contours"]),
+        "TERRAIN_IDW_MAX_CONTOURS": str(terrain_idw["max_contours"]),
+        "TERRAIN_IDW_MIN_ELEVATION_LEVELS": str(
+            terrain_idw["min_elevation_levels"]
+        ),
+        "TERRAIN_IDW_POWER": str(terrain_idw["power"]),
         "LAND_COVER_INPUT_GPKG": str(input_files["land_cover_gpkg"]),
         "GROUND_FACTOR_MAPPING_CSV": str(
             input_files["ground_factor_mapping_csv"]

@@ -4,16 +4,16 @@ import geopandas as gpd
 import pandas as pd
 import numpy as np
 import pyogrio
-import rasterio
 import shapely
 
-from pyproj import Transformer
+from pyproj import CRS, Transformer
 from shapely.geometry import box
 from shapely.strtree import STRtree
 
 try:
     from scripts.pipeline_common import (
         get_env_float,
+        get_env_int,
         get_env_path,
         validate_bounds,
         validate_input_paths,
@@ -23,6 +23,7 @@ try:
 except ModuleNotFoundError:
     from pipeline_common import (
         get_env_float,
+        get_env_int,
         get_env_path,
         validate_bounds,
         validate_input_paths,
@@ -36,9 +37,9 @@ except ModuleNotFoundError:
 # =========================
 project_dir = Path(__file__).resolve().parents[1]
 
-input_dem_path = get_env_path(
-    "TERRAIN_DEM_INPUT_TIF",
-    project_dir / "metadata/terrain/terrain_dem.tif",
+input_contour_path = get_env_path(
+    "TERRAIN_CONTOUR_INPUT_SHP",
+    project_dir / "data/terrain/terrain.shp",
 )
 input_land_cover_path = get_env_path(
     "LAND_COVER_INPUT_GPKG",
@@ -55,6 +56,7 @@ output_csv_path = get_env_path(
 
 land_cover_layer_name = "land_cover_map"
 land_cover_code_field = "L2_CODE"
+elevation_field = "CONT"
 receiver_crs = "EPSG:5179"
 coverage_tolerance = 1.0e-4
 spatial_epsilon = 1.0e-6
@@ -69,6 +71,24 @@ max_y = get_env_float("RECEIVER_MAX_Y", 1733000)
 receiver_height_m = 1.5
 
 spatial_chunk_size = 100_000
+idw_search_radius_m = get_env_float(
+    "TERRAIN_IDW_SEARCH_RADIUS_M",
+    800.0,
+)
+idw_max_search_radius_m = get_env_float(
+    "TERRAIN_IDW_MAX_SEARCH_RADIUS_M",
+    2000.0,
+)
+idw_min_contours = get_env_int("TERRAIN_IDW_MIN_CONTOURS", 4)
+idw_max_contours = get_env_int("TERRAIN_IDW_MAX_CONTOURS", 8)
+idw_min_elevation_levels = get_env_int(
+    "TERRAIN_IDW_MIN_ELEVATION_LEVELS",
+    2,
+)
+idw_power = get_env_float("TERRAIN_IDW_POWER", 2.0)
+idw_zero_distance_tolerance_m = 1.0e-9
+contour_simplify_tolerance_m = min(2.0, grid_m / 5.0)
+contour_distance_chunk_size = 2_000
 
 save_debug_grid = False
 debug_grid_csv_path = project_dir / "receivers/terrain/debug_grid_10m.csv"
@@ -577,94 +597,358 @@ def assign_ground_factor(grid_df):
 
 
 # =========================
-# DEM 고도 추출 함수
+# 등고선 객체 로드 함수
 # =========================
-def read_dem_ground_z(dem_path, grid_df):
+def read_contours(contour_path):
+    """IDW 입력 등고선 객체 로드"""
+    search_bounds = (
+        min_x - idw_max_search_radius_m,
+        min_y - idw_max_search_radius_m,
+        max_x + idw_max_search_radius_m,
+        max_y + idw_max_search_radius_m,
+    )
+    contour_info = pyogrio.read_info(contour_path)
+    contour_crs_value = contour_info.get("crs")
+    if contour_crs_value is None:
+        raise ValueError(f"등고선 CRS가 없습니다: {contour_path}")
+    contour_crs = CRS.from_user_input(contour_crs_value)
+    source_bounds = search_bounds
+    if contour_crs.to_epsg() != 5179:
+        bounds_transformer = Transformer.from_crs(
+            receiver_crs,
+            contour_crs,
+            always_xy=True,
+        )
+        source_bounds = bounds_transformer.transform_bounds(
+            *search_bounds,
+            densify_pts=21,
+        )
+
+    contour_gdf = gpd.read_file(contour_path, bbox=source_bounds)
+    if elevation_field not in contour_gdf.columns:
+        raise ValueError(
+            f"등고선 고도 필드가 없습니다: {elevation_field}"
+        )
+    if contour_gdf.crs.to_epsg() != 5179:
+        contour_gdf = contour_gdf.to_crs(receiver_crs)
+
+    contour_gdf[elevation_field] = pd.to_numeric(
+        contour_gdf[elevation_field],
+        errors="coerce",
+    )
+    valid_mask = (
+        contour_gdf.geometry.notna()
+        & ~contour_gdf.geometry.is_empty
+        & np.isfinite(contour_gdf[elevation_field])
+    )
+    contour_gdf = contour_gdf.loc[valid_mask].copy()
+    if contour_gdf.empty:
+        raise ValueError("IDW 계산에 사용할 등고선 객체가 없습니다.")
+
+    simplified_geometries = shapely.simplify(
+        contour_gdf.geometry.to_numpy(),
+        contour_simplify_tolerance_m,
+        preserve_topology=False,
+    )
+    simplified_valid_mask = ~shapely.is_empty(simplified_geometries)
+    contours = simplified_geometries[simplified_valid_mask]
+    elevations = contour_gdf.loc[
+        simplified_valid_mask,
+        elevation_field,
+    ].to_numpy(dtype=float)
+
+    print("[IDW 등고선 입력]")
+    print(" - path:", contour_path)
+    print(" - contour features:", len(contours))
+    print(" - simplification tolerance:", contour_simplify_tolerance_m, "m")
+    print(" - elevation min:", elevations.min())
+    print(" - elevation max:", elevations.max())
+    return contours, elevations
+
+
+# =========================
+# 등고선별 최근접 거리 계산 함수
+# =========================
+def query_nearest_contours(points, contour_tree, contours, elevations, radius):
+    """반경 내 등고선별 최근접 거리 행렬 반환"""
+    point_count = len(points)
+    distance_matrix = np.full(
+        (point_count, idw_max_contours),
+        np.inf,
+        dtype=float,
+    )
+    elevation_matrix = np.full(
+        (point_count, idw_max_contours),
+        np.nan,
+        dtype=float,
+    )
+    candidate_pairs = contour_tree.query(
+        points,
+        predicate="dwithin",
+        distance=radius,
+    )
+    if candidate_pairs.shape[1] == 0:
+        return distance_matrix, elevation_matrix
+
+    point_ids = candidate_pairs[0]
+    contour_ids = candidate_pairs[1]
+    distances = shapely.distance(
+        points[point_ids],
+        contours[contour_ids],
+    )
+    within_mask = distances <= radius + spatial_epsilon
+    point_ids = point_ids[within_mask]
+    contour_ids = contour_ids[within_mask]
+    distances = distances[within_mask]
+    order = np.lexsort((contour_ids, distances, point_ids))
+    point_ids = point_ids[order]
+    contour_ids = contour_ids[order]
+    distances = distances[order]
+    group_starts = np.flatnonzero(
+        np.r_[True, point_ids[1:] != point_ids[:-1]]
+    )
+    ranks = np.arange(len(point_ids)) - np.repeat(
+        group_starts,
+        np.diff(np.r_[group_starts, len(point_ids)]),
+    )
+    selected_mask = ranks < idw_max_contours
+    selected_point_ids = point_ids[selected_mask]
+    selected_contour_ids = contour_ids[selected_mask]
+    selected_ranks = ranks[selected_mask]
+    distance_matrix[selected_point_ids, selected_ranks] = distances[
+        selected_mask
+    ]
+    elevation_matrix[selected_point_ids, selected_ranks] = elevations[
+        selected_contour_ids
+    ]
+    return distance_matrix, elevation_matrix
+
+
+def count_elevation_levels(elevation_matrix):
+    """수음점별 서로 다른 등고선 표고 수 반환"""
+    valid_mask = np.isfinite(elevation_matrix)
+    sorted_elevations = np.sort(
+        np.where(valid_mask, elevation_matrix, np.inf),
+        axis=1,
+    )
+    lower_levels = sorted_elevations[:, :-1]
+    upper_levels = sorted_elevations[:, 1:]
+    finite_pairs = np.isfinite(lower_levels) & np.isfinite(upper_levels)
+    elevation_differences = np.zeros_like(lower_levels)
+    np.subtract(
+        upper_levels,
+        lower_levels,
+        out=elevation_differences,
+        where=finite_pairs,
+    )
+    level_changes = finite_pairs & (np.abs(elevation_differences) > 1.0e-6)
+    return valid_mask.any(axis=1).astype(np.int64) + level_changes.sum(axis=1)
+
+
+def calculate_neighbor_idw(distance_matrix, elevation_matrix, receiver_xy):
+    """등고선 최근접 거리 기반 IDW 고도 반환"""
+    valid_mask = np.isfinite(distance_matrix) & np.isfinite(elevation_matrix)
+    exact_mask = valid_mask & (
+        distance_matrix <= idw_zero_distance_tolerance_m
+    )
+    exact_rows = exact_mask.any(axis=1)
+    for row_id in np.flatnonzero(exact_rows):
+        exact_elevations = elevation_matrix[row_id, exact_mask[row_id]]
+        if exact_elevations.max() - exact_elevations.min() > 1.0e-6:
+            raise ValueError(
+                "수음점과 교차하는 등고선의 표고가 서로 다릅니다.\n"
+                f"좌표: x={receiver_xy[row_id, 0]:.3f}, "
+                f"y={receiver_xy[row_id, 1]:.3f}\n"
+                f"표고: {exact_elevations.tolist()}"
+            )
+
+    weights = np.zeros_like(distance_matrix, dtype=float)
+    weighted_mask = valid_mask & ~exact_rows[:, None]
+    weights[weighted_mask] = (
+        1.0 / distance_matrix[weighted_mask] ** idw_power
+    )
+    ground_z = np.zeros(len(distance_matrix), dtype=float)
+    weighted_rows = ~exact_rows
+    ground_z[weighted_rows] = (
+        (weights * np.nan_to_num(elevation_matrix)).sum(axis=1)[weighted_rows]
+        / weights.sum(axis=1)[weighted_rows]
+    )
+    if exact_rows.any():
+        exact_columns = exact_mask.argmax(axis=1)
+        ground_z[exact_rows] = elevation_matrix[
+            np.arange(len(elevation_matrix))[exact_rows],
+            exact_columns[exact_rows],
+        ]
+    return ground_z, exact_rows
+
+
+# =========================
+# 적응형 등고선 IDW 고도 계산 함수
+# =========================
+def calculate_contour_idw_ground_z(contours, elevations, grid_df):
+    """기준 반경과 최소 등고선 조건 기반 IDW 고도 계산"""
     recv_x = grid_df["x_epsg5179"].to_numpy(dtype=float)
     recv_y = grid_df["y_epsg5179"].to_numpy(dtype=float)
+    contour_tree = STRtree(contours)
+    ground_z = np.full(len(grid_df), np.nan, dtype=float)
+    chunk_count = int(np.ceil(len(grid_df) / contour_distance_chunk_size))
+    fallback_receiver_count = 0
+    exact_receiver_count = 0
+    selected_contour_total = 0
+    selected_contour_minimum = idw_max_contours
+    selected_contour_maximum = 0
+    elevation_level_total = 0
+    elevation_level_minimum = idw_max_contours
+    elevation_level_maximum = 0
+    maximum_used_distance = 0.0
 
-    with rasterio.open(dem_path) as dataset:
-        if dataset.crs is None:
-            raise ValueError(f"DEM CRS가 없습니다: {dem_path}")
-        if dataset.crs.to_epsg() != 5179:
-            raise ValueError(
-                "DEM 좌표계는 EPSG:5179여야 합니다: "
-                f"{dataset.crs}"
-            )
-        if not np.isclose(dataset.transform.b, 0.0) or not np.isclose(
-            dataset.transform.d,
-            0.0,
-        ):
-            raise ValueError("회전된 DEM 격자는 지원하지 않습니다.")
+    print("[적응형 등고선 IDW 지면고도]")
+    print(" - receivers:", len(grid_df))
+    print(" - reference radius:", idw_search_radius_m, "m")
+    print(" - maximum radius:", idw_max_search_radius_m, "m")
+    print(" - minimum contours:", idw_min_contours)
+    print(" - maximum contours:", idw_max_contours)
+    print(" - minimum elevation levels:", idw_min_elevation_levels)
+    print(" - power:", idw_power)
 
-        pixel_width = abs(dataset.transform.a)
-        pixel_height = abs(dataset.transform.e)
-        if not np.isclose(pixel_width, grid_m) or not np.isclose(
-            pixel_height,
-            grid_m,
-        ):
-            raise ValueError(
-                "DEM 해상도와 수음점 해상도가 다릅니다: "
-                f"DEM={pixel_width}x{pixel_height}m, "
-                f"수음점={grid_m}m"
-            )
-
-        bounds = dataset.bounds
-        tolerance = max(pixel_width, pixel_height) * 1.0e-6
-        if (
-            bounds.left > min_x + tolerance
-            or bounds.right < max_x - tolerance
-            or bounds.bottom > min_y + tolerance
-            or bounds.top < max_y - tolerance
-        ):
-            raise ValueError(
-                "DEM이 계산 영역 전체를 포함하지 않습니다.\n"
-                f"DEM: X={bounds.left:.1f}~{bounds.right:.1f}, "
-                f"Y={bounds.bottom:.1f}~{bounds.top:.1f}\n"
-                f"영역: X={min_x:.1f}~{max_x:.1f}, "
-                f"Y={min_y:.1f}~{max_y:.1f}"
-            )
-
-        columns = np.floor(
-            (recv_x - dataset.transform.c) / pixel_width
-        ).astype(np.int64)
-        rows = np.floor(
-            (dataset.transform.f - recv_y) / pixel_height
-        ).astype(np.int64)
-        inside = (
-            (rows >= 0)
-            & (rows < dataset.height)
-            & (columns >= 0)
-            & (columns < dataset.width)
+    for chunk_no, start in enumerate(
+        range(0, len(grid_df), contour_distance_chunk_size),
+        start=1,
+    ):
+        end = min(start + contour_distance_chunk_size, len(grid_df))
+        receiver_coordinates = np.column_stack([
+            recv_x[start:end],
+            recv_y[start:end],
+        ])
+        receiver_points = shapely.points(
+            receiver_coordinates[:, 0],
+            receiver_coordinates[:, 1],
         )
-        if not inside.all():
+        distance_matrix, elevation_matrix = query_nearest_contours(
+            receiver_points,
+            contour_tree,
+            contours,
+            elevations,
+            idw_search_radius_m,
+        )
+        valid_mask = np.isfinite(distance_matrix)
+        contour_counts = valid_mask.sum(axis=1)
+        elevation_level_counts = count_elevation_levels(elevation_matrix)
+        exact_mask = valid_mask & (
+            distance_matrix <= idw_zero_distance_tolerance_m
+        )
+        exact_rows = exact_mask.any(axis=1)
+        fallback_rows = (~exact_rows) & (
+            (contour_counts < idw_min_contours)
+            | (elevation_level_counts < idw_min_elevation_levels)
+        )
+
+        if fallback_rows.any():
+            fallback_distances, fallback_elevations = query_nearest_contours(
+                receiver_points[fallback_rows],
+                contour_tree,
+                contours,
+                elevations,
+                idw_max_search_radius_m,
+            )
+            distance_matrix[fallback_rows] = fallback_distances
+            elevation_matrix[fallback_rows] = fallback_elevations
+            valid_mask = np.isfinite(distance_matrix)
+            contour_counts = valid_mask.sum(axis=1)
+            elevation_level_counts = count_elevation_levels(elevation_matrix)
+
+        insufficient_mask = (~exact_rows) & (
+            (contour_counts < idw_min_contours)
+            | (elevation_level_counts < idw_min_elevation_levels)
+        )
+        if insufficient_mask.any():
+            example_lines = []
+            for local_id in np.flatnonzero(insufficient_mask)[:10]:
+                global_id = start + local_id
+                example_lines.append(
+                    f" - cell={global_id}, "
+                    f"x={recv_x[global_id]:.3f}, "
+                    f"y={recv_y[global_id]:.3f}, "
+                    f"등고선={contour_counts[local_id]}, "
+                    f"표고 단계={elevation_level_counts[local_id]}"
+                )
             raise ValueError(
-                "DEM 바깥에 위치한 지면 수음점이 있습니다: "
-                f"{int((~inside).sum()):,}개"
+                "IDW 최대 반경 안에서 최소 등고선 조건을 "
+                "충족하지 못했습니다.\n"
+                f"최대 반경: {idw_max_search_radius_m:.1f}m\n"
+                f"최소 등고선 개수: {idw_min_contours}\n"
+                f"최소 표고 단계 수: {idw_min_elevation_levels}\n"
+                f"실패 수음점 수: {int(insufficient_mask.sum()):,}\n"
+                + "\n".join(example_lines)
             )
 
-        dem = dataset.read(1, masked=True)
-        sampled = dem[rows, columns]
-        ground_z = np.asarray(sampled.filled(np.nan), dtype=float)
+        chunk_ground_z, exact_rows = calculate_neighbor_idw(
+            distance_matrix,
+            elevation_matrix,
+            receiver_coordinates,
+        )
+        ground_z[start:end] = chunk_ground_z
+        effective_contour_counts = contour_counts.copy()
+        effective_level_counts = elevation_level_counts.copy()
+        effective_contour_counts[exact_rows] = 1
+        effective_level_counts[exact_rows] = 1
+        selected_contour_total += int(effective_contour_counts.sum())
+        selected_contour_minimum = min(
+            selected_contour_minimum,
+            int(effective_contour_counts.min()),
+        )
+        selected_contour_maximum = max(
+            selected_contour_maximum,
+            int(effective_contour_counts.max()),
+        )
+        elevation_level_total += int(effective_level_counts.sum())
+        elevation_level_minimum = min(
+            elevation_level_minimum,
+            int(effective_level_counts.min()),
+        )
+        elevation_level_maximum = max(
+            elevation_level_maximum,
+            int(effective_level_counts.max()),
+        )
+        used_mask = valid_mask & ~exact_rows[:, None]
+        used_distances = distance_matrix[used_mask]
+        if len(used_distances) > 0:
+            maximum_used_distance = max(
+                maximum_used_distance,
+                float(used_distances.max()),
+            )
+        fallback_receiver_count += int(fallback_rows.sum())
+        exact_receiver_count += int(exact_rows.sum())
+        print(
+            f" - chunk {chunk_no}/{chunk_count}: "
+            f"{end:,}/{len(grid_df):,}"
+        )
 
-        print("[DEM 지면고도]")
-        print(" - path:", dem_path)
-        print(" - crs:", dataset.crs)
-        print(" - resolution:", pixel_width, "m")
-        print(" - receivers:", len(ground_z))
-
-    missing_mask = ~np.isfinite(ground_z)
-    if missing_mask.any():
-        missing_grid = grid_df.loc[
-            missing_mask,
-            ["x_epsg5179", "y_epsg5179"],
-        ].head(10)
+    if not np.isfinite(ground_z).all():
+        invalid_ids = np.flatnonzero(~np.isfinite(ground_z))[:10]
         raise ValueError(
-            "DEM 고도가 없는 지면 수음점이 있습니다.\n"
-            f"누락 수음점 수: {int(missing_mask.sum()):,}\n"
-            f"예시 좌표:\n{missing_grid.to_string(index=False)}"
+            "IDW 고도를 계산하지 못한 수음점이 있습니다: "
+            f"{invalid_ids.tolist()}"
         )
 
+    print("[IDW 계산 결과]")
+    print(" - exact contour points:", exact_receiver_count)
+    print(" - expanded-radius receivers:", fallback_receiver_count)
+    print(
+        " - selected contours min/mean/max:",
+        selected_contour_minimum,
+        f"{selected_contour_total / len(grid_df):.1f}",
+        selected_contour_maximum,
+    )
+    print(
+        " - elevation levels min/mean/max:",
+        elevation_level_minimum,
+        f"{elevation_level_total / len(grid_df):.1f}",
+        elevation_level_maximum,
+    )
+    print(" - maximum used distance:", f"{maximum_used_distance:.1f}m")
+    print(" - elevation min:", ground_z.min())
+    print(" - elevation max:", ground_z.max())
     return ground_z
 
 
@@ -673,7 +957,12 @@ def read_dem_ground_z(dem_path, grid_df):
 # =========================
 def make_terrain_receivers():
     grid_df = assign_ground_factor(make_grid())
-    ground_z = read_dem_ground_z(input_dem_path, grid_df)
+    contours, elevations = read_contours(input_contour_path)
+    ground_z = calculate_contour_idw_ground_z(
+        contours,
+        elevations,
+        grid_df,
+    )
 
     receivers = grid_df.copy()
     receivers["ground_alt"] = ground_z
@@ -685,8 +974,27 @@ def make_terrain_receivers():
 def main():
     validate_bounds(min_x, max_x, min_y, max_y)
     validate_positive(grid_m, "지면 수음점 해상도")
+    validate_positive(idw_search_radius_m, "IDW 기준 반경")
+    validate_positive(idw_max_search_radius_m, "IDW 최대 반경")
+    validate_positive(idw_min_contours, "IDW 최소 등고선 개수")
+    validate_positive(idw_max_contours, "IDW 최대 등고선 개수")
+    validate_positive(
+        idw_min_elevation_levels,
+        "IDW 최소 표고 단계 수",
+    )
+    validate_positive(idw_power, "IDW 가중 지수")
+    if idw_search_radius_m > idw_max_search_radius_m:
+        raise ValueError("IDW 기준 반경은 최대 반경보다 클 수 없습니다.")
+    if idw_min_contours > idw_max_contours:
+        raise ValueError(
+            "IDW 최소 등고선 개수는 최대 등고선 개수보다 클 수 없습니다."
+        )
+    if idw_min_elevation_levels > idw_max_contours:
+        raise ValueError(
+            "IDW 최소 표고 단계 수는 최대 등고선 개수보다 클 수 없습니다."
+        )
     validate_input_paths([
-        input_dem_path,
+        input_contour_path,
         input_land_cover_path,
         ground_factor_mapping_path,
     ])
@@ -696,6 +1004,17 @@ def main():
         label="토지피복도",
         required_bounds=area_bounds,
         layer=land_cover_layer_name,
+    )
+    contour_bounds = (
+        min_x - idw_max_search_radius_m,
+        min_y - idw_max_search_radius_m,
+        max_x + idw_max_search_radius_m,
+        max_y + idw_max_search_radius_m,
+    )
+    validate_spatial_file_coverage(
+        path=input_contour_path,
+        label="등고선",
+        required_bounds=contour_bounds,
     )
     output_csv_path.parent.mkdir(parents=True, exist_ok=True)
 

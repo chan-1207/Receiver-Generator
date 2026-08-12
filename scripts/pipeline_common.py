@@ -25,6 +25,14 @@ INPUT_FILE_KEYS = [
 
 RECEIVER_CRS = "EPSG:5179"
 TERRAIN_DEM_SOURCE_PADDING_M = 2000.0
+DEFAULT_TERRAIN_IDW_SETTINGS = {
+    "search_radius_m": 800.0,
+    "max_search_radius_m": 2000.0,
+    "min_contours": 4,
+    "max_contours": 8,
+    "min_elevation_levels": 2,
+    "power": 2.0,
+}
 INVALID_FILENAME_CHARACTERS = '<>:"/\\|?*'
 
 
@@ -39,6 +47,16 @@ def get_env_float(name, default):
         return float(os.environ.get(name, default))
     except (TypeError, ValueError) as error:
         raise ValueError(f"환경변수 {name}의 값이 숫자가 아닙니다.") from error
+
+
+def get_env_int(name, default):
+    """환경변수 기반 정수 반환"""
+    raw_value = os.environ.get(name, default)
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"환경변수 {name}의 값이 정수가 아닙니다.") from error
+    return value
 
 
 def get_env_bool(name, default):
@@ -127,6 +145,63 @@ def validate_grid_settings(settings):
             "격자 크기는 해상도의 정수배여야 합니다: "
             f"{grid_size_m} / {resolution_m}"
         )
+
+
+def load_terrain_idw_settings(raw_settings):
+    """IDW 설정 로드 및 검증"""
+    raw_idw = raw_settings.get("terrain_idw", {})
+    if not isinstance(raw_idw, dict):
+        raise ValueError("설정 파일의 terrain_idw 항목은 객체여야 합니다.")
+
+    idw_settings = DEFAULT_TERRAIN_IDW_SETTINGS.copy()
+    idw_settings.update(raw_idw)
+    try:
+        for name in ("search_radius_m", "max_search_radius_m", "power"):
+            idw_settings[name] = float(idw_settings[name])
+        for name in (
+            "min_contours",
+            "max_contours",
+            "min_elevation_levels",
+        ):
+            raw_value = idw_settings[name]
+            numeric_value = float(raw_value)
+            if not numeric_value.is_integer():
+                raise ValueError
+            idw_settings[name] = int(numeric_value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "terrain_idw의 반경·등고선 개수·가중 지수는 숫자여야 합니다."
+        ) from error
+
+    validate_positive(idw_settings["search_radius_m"], "IDW 기준 반경")
+    validate_positive(
+        idw_settings["max_search_radius_m"],
+        "IDW 최대 반경",
+    )
+    validate_positive(idw_settings["min_contours"], "IDW 최소 등고선 개수")
+    validate_positive(idw_settings["max_contours"], "IDW 최대 등고선 개수")
+    validate_positive(
+        idw_settings["min_elevation_levels"],
+        "IDW 최소 표고 단계 수",
+    )
+    validate_positive(idw_settings["power"], "IDW 가중 지수")
+    if (
+        idw_settings["search_radius_m"]
+        > idw_settings["max_search_radius_m"]
+    ):
+        raise ValueError("IDW 기준 반경은 최대 반경보다 클 수 없습니다.")
+    if idw_settings["min_contours"] > idw_settings["max_contours"]:
+        raise ValueError(
+            "IDW 최소 등고선 개수는 최대 등고선 개수보다 클 수 없습니다."
+        )
+    if (
+        idw_settings["min_elevation_levels"]
+        > idw_settings["max_contours"]
+    ):
+        raise ValueError(
+            "IDW 최소 표고 단계 수는 최대 등고선 개수보다 클 수 없습니다."
+        )
+    return idw_settings
 
 
 def validate_input_paths(paths):
@@ -248,11 +323,12 @@ def validate_pipeline_spatial_coverage(settings):
         settings["max_x"],
         settings["max_y"],
     )
+    terrain_padding_m = settings["terrain_idw"]["max_search_radius_m"]
     terrain_bounds = (
-        settings["min_x"] - TERRAIN_DEM_SOURCE_PADDING_M,
-        settings["min_y"] - TERRAIN_DEM_SOURCE_PADDING_M,
-        settings["max_x"] + TERRAIN_DEM_SOURCE_PADDING_M,
-        settings["max_y"] + TERRAIN_DEM_SOURCE_PADDING_M,
+        settings["min_x"] - terrain_padding_m,
+        settings["min_y"] - terrain_padding_m,
+        settings["max_x"] + terrain_padding_m,
+        settings["max_y"] + terrain_padding_m,
     )
     input_files = settings["input_files"]
     specifications = [
@@ -336,6 +412,7 @@ def load_pipeline_settings(config_path, project_dir):
         key: resolve_input_path(input_files[key], project_dir)
         for key in INPUT_FILE_KEYS
     }
+    settings["terrain_idw"] = load_terrain_idw_settings(raw_settings)
 
     output_filename = raw_settings.get("output_filename", {})
     if not isinstance(output_filename, dict):
