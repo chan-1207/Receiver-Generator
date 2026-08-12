@@ -1,12 +1,12 @@
 {
-  "min_x": 1145000,
-  "max_x": 1146000,
-  "min_y": 1735000,
-  "max_y": 1736000,
+  "min_x": 1137100,
+  "max_x": 1150500,
+  "min_y": 1726100,
+  "max_y": 1740900,
   "resolution_m": 10.0,
   "grid_size_m": 100.0,
   "output_filename": {
-    "prefix": "cropped_",
+    "prefix": "",
     "suffix": ""
   },
   "input_files": {

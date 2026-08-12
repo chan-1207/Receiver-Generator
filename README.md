@@ -31,6 +31,10 @@
   "max_y": 1733000,
   "resolution_m": 10.0,
   "grid_size_m": 100.0,
+  "output_filename": {
+    "prefix": "case_a_",
+    "suffix": "_10m"
+  },
   "input_files": {
     "building_height_gpkg": "data/building_height/building_height.gpkg",
     "terrain_contour_shp": "data/terrain/terrain.shp",
@@ -46,6 +50,27 @@
 .\.venv\Scripts\python.exe main.py
 ```
 
+케이스별 산출물을 구분하려면 `output_filename.prefix`와
+`output_filename.suffix`를 설정합니다. 위 예시의 최종 파일명은
+`case_a_merged_receivers_10m.csv`입니다. 접두사와 접미사는 모든 중간
+산출물과 최종 병합 파일에 동일하게 적용됩니다.
+
+명령행 옵션은 설정 파일의 값을 이번 실행에만 덮어쓸 때 사용할 수 있습니다.
+
+```powershell
+# 접두사 임시 지정 예시
+.\.venv\Scripts\python.exe main.py --prefix case_a_
+
+# 접미사 임시 지정 예시
+.\.venv\Scripts\python.exe main.py --suffix _case_a
+
+# 동시 임시 지정 예시
+.\.venv\Scripts\python.exe main.py --prefix test_ --suffix _case_a
+```
+
+명령행 옵션 없이 실행하면 설정 파일의 값을 사용합니다. `output_filename` 항목을
+생략하면 접두사와 접미사가 없는 기존 기본 파일명을 사용합니다.
+
 `resolution_m`은 지형 DEM과 지면 격자, 건물 벽면·지붕 수음점에 공통으로
 적용됩니다. `grid_size_m`은 `resolution_m`의 정수배여야 하며,
 X/Y 영역 길이는 두 크기의 정수배여야 합니다.
@@ -60,6 +85,11 @@ X/Y 영역 길이는 두 크기의 정수배여야 합니다.
 출력하고 계산을 시작하지 않습니다. 등고선으로 설정 해상도의 GeoTIFF DEM을
 생성하고, TIN이 영역 전체를 덮는지도 검사합니다. 토지피복도는 지면 격자별
 실제 피복률을 검사하며, DEM 고도가 하나라도 없으면 지면 수음점 저장을 중단합니다.
+
+건물 입력 파일은 존재하지만 계산 영역과 교차하는 건물이 없으면 오류로 중단하지
+않습니다. 건물 데이터셋·버퍼·벽면·지붕 수음점 단계를 로그와 함께 건너뛰고,
+DEM과 지면 수음점을 생성한 뒤 지면 수음점만 최종 파일로 병합합니다. 이 경우
+이전 실행에서 생성된 건물 산출물은 읽지 않습니다.
 
 개별 단계는 `scripts` 디렉터리에서 다음 순서로 실행할 수도 있습니다.
 

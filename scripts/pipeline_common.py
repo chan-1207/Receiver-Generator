@@ -25,6 +25,7 @@ INPUT_FILE_KEYS = [
 
 RECEIVER_CRS = "EPSG:5179"
 TERRAIN_DEM_SOURCE_PADDING_M = 2000.0
+INVALID_FILENAME_CHARACTERS = '<>:"/\\|?*'
 
 
 def get_env_path(name, default):
@@ -38,6 +39,20 @@ def get_env_float(name, default):
         return float(os.environ.get(name, default))
     except (TypeError, ValueError) as error:
         raise ValueError(f"환경변수 {name}의 값이 숫자가 아닙니다.") from error
+
+
+def get_env_bool(name, default):
+    """환경변수 기반 불리언 반환"""
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+
+    normalized_value = raw_value.strip().lower()
+    if normalized_value in {"1", "true", "yes", "on"}:
+        return True
+    if normalized_value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"환경변수 {name}의 값이 불리언이 아닙니다.")
 
 
 def resolve_input_path(path_value, project_dir):
@@ -59,6 +74,20 @@ def validate_positive(value, name):
     """양수 설정값 검증"""
     if value <= 0:
         raise ValueError(f"{name}은 0보다 커야 합니다.")
+
+
+def validate_filename_affix(value, name):
+    """파일명 접두사 및 접미사 검증"""
+    if not isinstance(value, str):
+        raise ValueError(f"{name}은 문자열이어야 합니다.")
+    if any(character in INVALID_FILENAME_CHARACTERS for character in value):
+        raise ValueError(
+            f"{name}에 사용할 수 없는 문자가 포함되어 있습니다: "
+            f"{INVALID_FILENAME_CHARACTERS}"
+        )
+    if any(ord(character) < 32 for character in value):
+        raise ValueError(f"{name}에 제어 문자를 사용할 수 없습니다.")
+    return value
 
 
 def validate_grid_settings(settings):
@@ -106,6 +135,20 @@ def validate_input_paths(paths):
     if missing_paths:
         missing_text = "\n".join(f" - {path}" for path in missing_paths)
         raise FileNotFoundError(f"입력 파일이 없습니다:\n{missing_text}")
+
+
+def spatial_file_has_features(path, layer, bbox):
+    """지정 영역과 교차하는 공간 객체 존재 여부 반환"""
+    features = pyogrio.read_dataframe(
+        path,
+        layer=layer,
+        bbox=bbox,
+        columns=[],
+        read_geometry=False,
+        fid_as_index=True,
+        max_features=1,
+    )
+    return len(features) > 0
 
 
 def read_spatial_bounds(path, layer=None, target_crs=RECEIVER_CRS):
@@ -292,6 +335,17 @@ def load_pipeline_settings(config_path, project_dir):
     settings["input_files"] = {
         key: resolve_input_path(input_files[key], project_dir)
         for key in INPUT_FILE_KEYS
+    }
+
+    output_filename = raw_settings.get("output_filename", {})
+    if not isinstance(output_filename, dict):
+        raise ValueError("설정 파일의 output_filename 항목은 객체여야 합니다.")
+    settings["output_filename"] = {
+        name: validate_filename_affix(
+            output_filename.get(name, ""),
+            f"output_filename.{name}",
+        )
+        for name in ("prefix", "suffix")
     }
 
     validate_grid_settings(settings)

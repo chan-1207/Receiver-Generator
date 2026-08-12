@@ -8,6 +8,7 @@ from shapely.geometry import Point
 
 try:
     from scripts.pipeline_common import (
+        get_env_bool,
         get_env_float,
         get_env_path,
         validate_bounds,
@@ -16,6 +17,7 @@ try:
     )
 except ModuleNotFoundError:
     from pipeline_common import (
+        get_env_bool,
         get_env_float,
         get_env_path,
         validate_bounds,
@@ -63,6 +65,7 @@ min_x = get_env_float("RECEIVER_MIN_X", 1163000)
 max_x = get_env_float("RECEIVER_MAX_X", 1164000)
 min_y = get_env_float("RECEIVER_MIN_Y", 1732000)
 max_y = get_env_float("RECEIVER_MAX_Y", 1733000)
+has_buildings = get_env_bool("RECEIVER_HAS_BUILDINGS", True)
 
 
 # =========================
@@ -376,12 +379,14 @@ def main():
     validate_bounds(min_x, max_x, min_y, max_y)
     validate_positive(grid_size_m, "격자 크기")
     validate_positive(cell_size_m, "수음점 해상도")
-    validate_input_paths([
-        terrain_receiver_csv_path,
-        building_receiver_csv_path,
-        roof_receiver_csv_path,
-        building_buffer_gpkg_path,
-    ])
+    required_input_paths = [terrain_receiver_csv_path]
+    if has_buildings:
+        required_input_paths.extend([
+            building_receiver_csv_path,
+            roof_receiver_csv_path,
+            building_buffer_gpkg_path,
+        ])
+    validate_input_paths(required_input_paths)
     output_csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     # =========================
@@ -392,30 +397,36 @@ def main():
         receiver_type="terrain"
     )
 
-    building_df = read_receiver_csv(
-        building_receiver_csv_path,
-        receiver_type="building"
-    )
-
-    roof_df = read_receiver_csv(
-        roof_receiver_csv_path,
-        receiver_type="roof"
-    )
-
     validate_receiver_bounds(terrain_df, "terrain")
-    validate_receiver_bounds(building_df, "building")
-    validate_receiver_bounds(roof_df, "roof")
 
-    terrain_filtered = remove_terrain_points_inside_building_buffer(terrain_df)
-
-    merged = pd.concat(
-        [
-            terrain_filtered,
-            building_df,
-            roof_df,
-        ],
-        ignore_index=True
-    )
+    if has_buildings:
+        building_df = read_receiver_csv(
+            building_receiver_csv_path,
+            receiver_type="building"
+        )
+        roof_df = read_receiver_csv(
+            roof_receiver_csv_path,
+            receiver_type="roof"
+        )
+        validate_receiver_bounds(building_df, "building")
+        validate_receiver_bounds(roof_df, "roof")
+        terrain_filtered = remove_terrain_points_inside_building_buffer(
+            terrain_df
+        )
+        merged = pd.concat(
+            [terrain_filtered, building_df, roof_df],
+            ignore_index=True
+        )
+    else:
+        print("[건물 수음점 병합]")
+        print(" - 계산 영역 내 건물 없음")
+        print(" - 벽면·지붕 수음점 및 건물 버퍼 처리 생략")
+        print("[지면 수음점 필터링]")
+        print(" - 건물 버퍼 필터링 생략")
+        print(" - before:", len(terrain_df))
+        print(" - removed: 0")
+        print(" - after:", len(terrain_df))
+        merged = terrain_df.copy()
 
     merged = add_grid_id(merged)
     merged = assign_receiver_id(merged)
