@@ -1,17 +1,21 @@
 import json
 import math
 import os
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import pyogrio
 from pyproj import Transformer
 
 
-NUMERIC_SETTING_KEYS = [
+AREA_SETTING_KEYS = [
     "min_x",
     "max_x",
     "min_y",
     "max_y",
+]
+
+GRID_SETTING_KEYS = [
     "resolution_m",
     "grid_size_m",
 ]
@@ -24,15 +28,19 @@ INPUT_FILE_KEYS = [
 ]
 
 RECEIVER_CRS = "EPSG:5179"
-TERRAIN_DEM_SOURCE_PADDING_M = 2000.0
 DEFAULT_TERRAIN_IDW_SETTINGS = {
     "search_radius_m": 800.0,
     "max_search_radius_m": 2000.0,
     "min_contours": 4,
     "max_contours": 8,
     "min_elevation_levels": 2,
+    "contour_simplify_tolerance_m": 2.0,
+}
+DEFAULT_PARALLEL_PROCESSING_SETTINGS = {
     "workers": 8,
-    "chunk_size": 2000,
+    "building_chunk_size": 250,
+    "ground_factor_chunk_size": 20_000,
+    "terrain_chunk_size": 2_000,
 }
 INVALID_FILENAME_CHARACTERS = '<>:"/\\|?*'
 
@@ -148,64 +156,164 @@ def validate_grid_settings(settings):
         )
 
 
+def load_parallel_processing_settings(raw_settings):
+    """공통 병렬 처리 설정 로드 및 검증"""
+    raw_parallel = raw_settings.get("parallel_processing", {})
+    if not isinstance(raw_parallel, dict):
+        raise ValueError(
+            "설정 파일의 parallel_processing 항목은 객체여야 합니다."
+        )
+
+    parallel_settings = {
+        "workers": raw_parallel.get(
+            "workers",
+            DEFAULT_PARALLEL_PROCESSING_SETTINGS["workers"],
+        ),
+        "building_chunk_size": raw_parallel.get(
+            "building_chunk_size",
+            DEFAULT_PARALLEL_PROCESSING_SETTINGS["building_chunk_size"],
+        ),
+        "ground_factor_chunk_size": raw_parallel.get(
+            "ground_factor_chunk_size",
+            DEFAULT_PARALLEL_PROCESSING_SETTINGS[
+                "ground_factor_chunk_size"
+            ],
+        ),
+        "terrain_chunk_size": raw_parallel.get(
+            "terrain_chunk_size",
+            raw_parallel.get(
+                "idw_chunk_size",
+                DEFAULT_PARALLEL_PROCESSING_SETTINGS["terrain_chunk_size"],
+            ),
+        ),
+    }
+    try:
+        for name in DEFAULT_PARALLEL_PROCESSING_SETTINGS:
+            raw_value = parallel_settings[name]
+            numeric_value = float(raw_value)
+            if not numeric_value.is_integer():
+                raise ValueError
+            parallel_settings[name] = int(numeric_value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "parallel_processing의 작업 수와 묶음 크기는 "
+            "정수여야 합니다."
+        ) from error
+
+    for name, label in (
+        ("workers", "공통 병렬 작업 수"),
+        ("building_chunk_size", "건물 묶음 크기"),
+        ("ground_factor_chunk_size", "지면계수 묶음 크기"),
+        ("terrain_chunk_size", "IDW 보간 묶음 크기"),
+    ):
+        validate_positive(parallel_settings[name], label)
+
+    return parallel_settings
+
+
+def parallel_map_ordered(function, values, workers, chunk_size):
+    """입력 순서를 보존하는 제한형 병렬 매핑"""
+    value_list = list(values)
+    if len(value_list) == 0:
+        return []
+
+    effective_chunk_size = min(
+        chunk_size,
+        max(1, math.ceil(len(value_list) / workers)),
+    )
+    chunk_ranges = [
+        (start, min(start + effective_chunk_size, len(value_list)))
+        for start in range(0, len(value_list), effective_chunk_size)
+    ]
+
+    def calculate(chunk_range):
+        start, end = chunk_range
+        return start, [function(value) for value in value_list[start:end]]
+
+    if workers == 1 or len(chunk_ranges) == 1:
+        result = [None] * len(value_list)
+        for chunk_range in chunk_ranges:
+            start, chunk_result = calculate(chunk_range)
+            result[start:start + len(chunk_result)] = chunk_result
+        return result
+
+    result = [None] * len(value_list)
+    chunk_iterator = iter(chunk_ranges)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        pending = {}
+        for _ in range(min(workers, len(chunk_ranges))):
+            chunk_range = next(chunk_iterator)
+            pending[executor.submit(calculate, chunk_range)] = chunk_range
+
+        while pending:
+            completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                pending.pop(future)
+                try:
+                    start, chunk_result = future.result()
+                except Exception:
+                    for pending_future in pending:
+                        pending_future.cancel()
+                    raise
+
+                result[start:start + len(chunk_result)] = chunk_result
+                next_chunk_range = next(chunk_iterator, None)
+                if next_chunk_range is not None:
+                    pending[
+                        executor.submit(calculate, next_chunk_range)
+                    ] = next_chunk_range
+
+    return result
+
+
 def load_terrain_idw_settings(raw_settings):
-    """IDW 설정 로드 및 검증"""
+    """메인 지면 생성용 IDW 설정 로드 및 검증"""
     raw_idw = raw_settings.get("terrain_idw", {})
     if not isinstance(raw_idw, dict):
         raise ValueError("설정 파일의 terrain_idw 항목은 객체여야 합니다.")
 
     idw_settings = DEFAULT_TERRAIN_IDW_SETTINGS.copy()
     idw_settings.update(raw_idw)
+    float_names = (
+        "search_radius_m",
+        "max_search_radius_m",
+        "contour_simplify_tolerance_m",
+    )
+    integer_names = (
+        "min_contours",
+        "max_contours",
+        "min_elevation_levels",
+    )
     try:
-        for name in ("search_radius_m", "max_search_radius_m"):
+        for name in float_names:
             idw_settings[name] = float(idw_settings[name])
-        for name in (
-            "min_contours",
-            "max_contours",
-            "min_elevation_levels",
-            "workers",
-            "chunk_size",
-        ):
-            raw_value = idw_settings[name]
-            numeric_value = float(raw_value)
+        for name in integer_names:
+            numeric_value = float(idw_settings[name])
             if not numeric_value.is_integer():
                 raise ValueError
             idw_settings[name] = int(numeric_value)
     except (TypeError, ValueError) as error:
-        raise ValueError(
-            "terrain_idw의 반경·등고선 개수·병렬 설정은 "
-            "숫자여야 합니다."
-        ) from error
+        raise ValueError("terrain_idw 설정값 형식이 올바르지 않습니다.") from error
 
-    validate_positive(idw_settings["search_radius_m"], "IDW 기준 반경")
+    validate_positive(idw_settings["search_radius_m"], "IDW 기준 탐색 반경")
     validate_positive(
         idw_settings["max_search_radius_m"],
-        "IDW 최대 반경",
+        "IDW 최대 탐색 반경",
     )
-    validate_positive(idw_settings["min_contours"], "IDW 최소 등고선 개수")
-    validate_positive(idw_settings["max_contours"], "IDW 최대 등고선 개수")
+    if idw_settings["search_radius_m"] > idw_settings["max_search_radius_m"]:
+        raise ValueError("IDW 기준 탐색 반경은 최대 탐색 반경 이하여야 합니다.")
+    validate_positive(idw_settings["min_contours"], "IDW 최소 등고선 수")
+    validate_positive(idw_settings["max_contours"], "IDW 최대 등고선 수")
+    if idw_settings["min_contours"] > idw_settings["max_contours"]:
+        raise ValueError("IDW 최소 등고선 수는 최대 등고선 수 이하여야 합니다.")
     validate_positive(
         idw_settings["min_elevation_levels"],
         "IDW 최소 표고 단계 수",
     )
-    validate_positive(idw_settings["workers"], "IDW 병렬 작업 수")
-    validate_positive(idw_settings["chunk_size"], "IDW 묶음 크기")
-    if (
-        idw_settings["search_radius_m"]
-        > idw_settings["max_search_radius_m"]
-    ):
-        raise ValueError("IDW 기준 반경은 최대 반경보다 클 수 없습니다.")
-    if idw_settings["min_contours"] > idw_settings["max_contours"]:
-        raise ValueError(
-            "IDW 최소 등고선 개수는 최대 등고선 개수보다 클 수 없습니다."
-        )
-    if (
-        idw_settings["min_elevation_levels"]
-        > idw_settings["max_contours"]
-    ):
-        raise ValueError(
-            "IDW 최소 표고 단계 수는 최대 등고선 개수보다 클 수 없습니다."
-        )
+    if idw_settings["min_elevation_levels"] > idw_settings["max_contours"]:
+        raise ValueError("IDW 최소 표고 단계 수는 최대 등고선 수 이하여야 합니다.")
+    if idw_settings["contour_simplify_tolerance_m"] < 0:
+        raise ValueError("IDW 등고선 단순화 허용오차는 0 이상이어야 합니다.")
     return idw_settings
 
 
@@ -384,12 +492,27 @@ def load_pipeline_settings(config_path, project_dir):
     with config_path.open("r", encoding="utf-8") as config_file:
         raw_settings = json.load(config_file)
 
-    missing_keys = [
-        key for key in NUMERIC_SETTING_KEYS
-        if key not in raw_settings
+    area = raw_settings.get("area")
+    if not isinstance(area, dict):
+        raise ValueError("설정 파일의 area 항목은 객체여야 합니다.")
+
+    grid = raw_settings.get("grid")
+    if not isinstance(grid, dict):
+        raise ValueError("설정 파일의 grid 항목은 객체여야 합니다.")
+
+    missing_area_keys = [
+        key for key in AREA_SETTING_KEYS
+        if key not in area
     ]
-    if missing_keys:
-        raise ValueError(f"설정 파일에 필수 항목이 없습니다: {missing_keys}")
+    if missing_area_keys:
+        raise ValueError(f"area에 필수 항목이 없습니다: {missing_area_keys}")
+
+    missing_grid_keys = [
+        key for key in GRID_SETTING_KEYS
+        if key not in grid
+    ]
+    if missing_grid_keys:
+        raise ValueError(f"grid에 필수 항목이 없습니다: {missing_grid_keys}")
 
     input_files = raw_settings.get("input_files")
     if not isinstance(input_files, dict):
@@ -407,8 +530,14 @@ def load_pipeline_settings(config_path, project_dir):
 
     try:
         settings = {
-            key: float(raw_settings[key])
-            for key in NUMERIC_SETTING_KEYS
+            **{
+                key: float(area[key])
+                for key in AREA_SETTING_KEYS
+            },
+            **{
+                key: float(grid[key])
+                for key in GRID_SETTING_KEYS
+            },
         }
     except (TypeError, ValueError) as error:
         raise ValueError("영역, 해상도, 격자 크기는 숫자여야 합니다.") from error
@@ -417,6 +546,9 @@ def load_pipeline_settings(config_path, project_dir):
         key: resolve_input_path(input_files[key], project_dir)
         for key in INPUT_FILE_KEYS
     }
+    settings["parallel_processing"] = load_parallel_processing_settings(
+        raw_settings
+    )
     settings["terrain_idw"] = load_terrain_idw_settings(raw_settings)
 
     output_filename = raw_settings.get("output_filename", {})

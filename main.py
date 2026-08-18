@@ -16,7 +16,7 @@ from scripts.pipeline_common import (
 # 프로젝트 경로
 # =========================================================
 project_dir = Path(__file__).resolve().parent
-config_path = project_dir / "config/receiver_generation.json"
+config_path = project_dir / "config/receiver_generation_full_range.json"
 
 
 # =========================================================
@@ -93,6 +93,7 @@ def make_output_paths(prefix="", suffix=""):
 def make_environment(settings, output_paths):
     """하위 스크립트 공통 환경변수 구성"""
     input_files = settings["input_files"]
+    parallel_processing = settings["parallel_processing"]
     terrain_idw = settings["terrain_idw"]
     env = os.environ.copy()
     env.update({
@@ -103,10 +104,22 @@ def make_environment(settings, output_paths):
         "RECEIVER_MAX_Y": str(settings["max_y"]),
         "RECEIVER_RESOLUTION_M": str(settings["resolution_m"]),
         "GRID_SIZE_M": str(settings["grid_size_m"]),
+        "PARALLEL_WORKERS": str(parallel_processing["workers"]),
+        "BUILDING_CHUNK_SIZE": str(
+            parallel_processing["building_chunk_size"]
+        ),
+        "GROUND_FACTOR_CHUNK_SIZE": str(
+            parallel_processing["ground_factor_chunk_size"]
+        ),
+        "TERRAIN_IDW_CHUNK_SIZE": str(
+            parallel_processing["terrain_chunk_size"]
+        ),
         "BUILDING_HEIGHT_INPUT_GPKG": str(input_files["building_height_gpkg"]),
         "BUILDING_ORIGINAL_INPUT_GPKG": str(input_files["building_height_gpkg"]),
         "TERRAIN_CONTOUR_INPUT_SHP": str(input_files["terrain_contour_shp"]),
-        "TERRAIN_IDW_SEARCH_RADIUS_M": str(terrain_idw["search_radius_m"]),
+        "TERRAIN_IDW_SEARCH_RADIUS_M": str(
+            terrain_idw["search_radius_m"]
+        ),
         "TERRAIN_IDW_MAX_SEARCH_RADIUS_M": str(
             terrain_idw["max_search_radius_m"]
         ),
@@ -115,8 +128,9 @@ def make_environment(settings, output_paths):
         "TERRAIN_IDW_MIN_ELEVATION_LEVELS": str(
             terrain_idw["min_elevation_levels"]
         ),
-        "TERRAIN_IDW_WORKERS": str(terrain_idw["workers"]),
-        "TERRAIN_IDW_CHUNK_SIZE": str(terrain_idw["chunk_size"]),
+        "TERRAIN_IDW_CONTOUR_SIMPLIFY_TOLERANCE_M": str(
+            terrain_idw["contour_simplify_tolerance_m"]
+        ),
         "LAND_COVER_INPUT_GPKG": str(input_files["land_cover_gpkg"]),
         "GROUND_FACTOR_MAPPING_CSV": str(
             input_files["ground_factor_mapping_csv"]

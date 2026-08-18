@@ -25,20 +25,29 @@
 
 ```json
 {
-  "min_x": 1163000,
-  "max_x": 1164000,
-  "min_y": 1732000,
-  "max_y": 1733000,
-  "resolution_m": 10.0,
-  "grid_size_m": 100.0,
+  "area": {
+    "min_x": 1163000,
+    "max_x": 1164000,
+    "min_y": 1732000,
+    "max_y": 1733000
+  },
+  "grid": {
+    "resolution_m": 10.0,
+    "grid_size_m": 100.0
+  },
+  "parallel_processing": {
+    "workers": 8,
+    "building_chunk_size": 250,
+    "ground_factor_chunk_size": 20000,
+    "terrain_chunk_size": 2000
+  },
   "terrain_idw": {
     "search_radius_m": 800.0,
     "max_search_radius_m": 2000.0,
     "min_contours": 4,
     "max_contours": 8,
     "min_elevation_levels": 2,
-    "workers": 8,
-    "chunk_size": 2000
+    "contour_simplify_tolerance_m": 2.0
   },
   "output_filename": {
     "prefix": "case_a_",
@@ -80,21 +89,53 @@
 명령행 옵션 없이 실행하면 설정 파일의 값을 사용합니다. `output_filename` 항목을
 생략하면 접두사와 접미사가 없는 기존 기본 파일명을 사용합니다.
 
-`resolution_m`은 지면 격자와 건물 벽면·지붕 수음점에 공통으로 적용됩니다.
-`grid_size_m`은 `resolution_m`의 정수배여야 하며, X/Y 영역 길이는 두
-크기의 정수배여야 합니다.
+### 설정 항목
 
-지면고도는 등고선 객체별 최근접 거리의 적응형 IDW 보간으로 계산합니다. 같은
-등고선의 여러 정점은 하나의 고도 정보로 처리합니다. 먼저 `search_radius_m` 안에서
-가까운 등고선을 최대 `max_contours`개 사용합니다. `min_contours`개 또는 서로 다른
-표고 `min_elevation_levels`단계를 확보하지 못하면 `max_search_radius_m`까지 탐색을
-확대합니다. 최대 반경에서도 조건을 충족하지 못하면 실패 좌표와 확보 정보를
-출력하고 중단합니다. 수음점이 등고선과 직접 교차하면 해당 표고를 사용합니다.
-거리 계산용 등고선은 수음점 해상도의 1/5과 2m 중 작은 값으로 단순화하며,
-거리 가중 지수는 2.0으로 고정합니다. `workers`는 동시에 계산할 IDW 작업 수이고,
-`chunk_size`는 각 작업이 한 번에 처리할 수음점 수입니다. 작업별 결과는 원래
-수음점 위치에 기록되므로 병렬 완료 순서와 관계없이 CSV 행 순서는 유지됩니다.
-병렬 작업 수를 `1`로 설정하면 순차 계산으로 실행됩니다.
+| 1단계 그룹 | 2단계 항목 | 의미 | 기본값 |
+|---|---|---|---:|
+| **`area`** | `min_x` | EPSG:5179 X 최솟값 | 필수 |
+|  | `max_x` | EPSG:5179 X 최댓값 | 필수 |
+|  | `min_y` | EPSG:5179 Y 최솟값 | 필수 |
+|  | `max_y` | EPSG:5179 Y 최댓값 | 필수 |
+| **`grid`** | `resolution_m` | 지면 및 건물 수음점 간격 | 10m |
+|  | `grid_size_m` | 병합 결과의 격자 ID 크기 | 100m |
+| **`parallel_processing`** | `workers` | 모든 병렬 계산의 공통 작업 수 | 8 |
+|  | `building_chunk_size` | 작업당 최대 건물 수 | 250 |
+|  | `ground_factor_chunk_size` | 작업당 최대 지면 셀 수 | 20,000 |
+|  | `terrain_chunk_size` | 작업당 최대 IDW 보간 수음점 수 | 2,000 |
+| **`terrain_idw`** | `search_radius_m` | 우선 탐색할 등고선 반경 | 800m |
+|  | `max_search_radius_m` | 조건 부족 시 확장할 최대 반경 | 2,000m |
+|  | `min_contours` | 수음점별 최소 등고선 수 | 4 |
+|  | `max_contours` | 수음점별 최대 등고선 수 | 8 |
+|  | `min_elevation_levels` | 최소 서로 다른 표고 단계 수 | 2 |
+|  | `contour_simplify_tolerance_m` | 거리 계산용 등고선 단순화 허용오차 | 2m |
+| **`output_filename`** | `prefix` | 모든 산출물의 파일명 접두사 | 빈 문자열 |
+|  | `suffix` | 모든 산출물의 파일명 접미사 | 빈 문자열 |
+| **`input_files`** | `building_height_gpkg` | 건물 높이 GeoPackage | 필수 |
+|  | `terrain_contour_shp` | 등고선 Shapefile | 필수 |
+|  | `land_cover_gpkg` | 토지피복 GeoPackage | 필수 |
+|  | `ground_factor_mapping_csv` | 토지피복별 지면계수 매핑 | 필수 |
+
+`grid.resolution_m`은 지면 격자와 건물 벽면·지붕 수음점에 공통으로 적용됩니다.
+`grid.grid_size_m`은 `grid.resolution_m`의 정수배여야 하며, X/Y 영역 길이는 두
+크기의 정수배여야 합니다. 데이터가 작으면 모든 작업자가 사용될 수 있도록 실제
+묶음 크기를 설정값보다 작게 자동 조정합니다. 작업 수를 `1`로 지정하면 모든
+계산을 순차 실행합니다.
+
+지면고도는 등고선 객체까지의 거리를 이용한 적응형 IDW로 계산합니다. 우선
+`search_radius_m` 안에서 가까운 등고선을 최대 `max_contours`개 사용합니다.
+최소 등고선 수 또는 서로 다른 표고 단계 수가 부족하면
+`max_search_radius_m`까지 탐색을 확대합니다. 수음점이 등고선과 직접 겹치면 해당
+등고선 표고를 사용합니다.
+
+IDW 입력에는 등고선뿐 아니라 `building_simplified` 건물 폴리곤도 포함합니다.
+각 건물 폴리곤까지의 최근접 거리와 해당 건물의 지반고 `BLDH_MN`을 사용하며,
+최소 `min_contours`개의 등고선을 우선 확보한 뒤 남은 후보를 등고선과 건물 중
+가까운 객체로 채워 지면고도를 계산합니다. 따라서 밀집 건물 지역에서도 등고선이
+IDW 입력에서 완전히 제외되지 않습니다. 동시에
+건물 폴리곤 내부 또는 경계에 놓인 지면 격자 중심점을 제거하고, 최종 병합 단계에서
+기존 1m 건물 버퍼 내부의 지면 수음점을 추가로 제거합니다. 보간 후 건물에 맞춰
+주변 지형고를 다시 자르는 사후 보정은 적용하지 않습니다.
 
 `input_files`의 경로는 프로젝트 루트 기준 상대경로 또는 절대경로로
 설정할 수 있습니다. `main.py`가 건물 메타데이터, 건물 버퍼, 벽면·지붕·지면
@@ -131,7 +172,8 @@
 - `scripts/generate_building_wall_buffers.py`: 벽면 수음점용 건물 버퍼 생성
 - `scripts/generate_building_wall_receivers.py`: 벽면 수음점 생성
 - `scripts/generate_building_roof_receivers.py`: 지붕 수음점 생성
-- `scripts/generate_terrain_receivers.py`: 등고선 IDW 고도 기반 지면 수음점 및 지면계수 생성
+  ([상세 생성 로직](docs/roof-receiver-generation.md))
+- `scripts/generate_terrain_receivers.py`: 등고선 IDW 및 건물 폴리곤 마스킹 기반 지면 수음점 및 지면계수 생성
 - `scripts/merge_receivers.py`: 수음점 필터링, 정렬, ID 부여 및 병합
 
 각 단계 스크립트의 실행부는 `main()`에 있으며, 파일을 모듈로 가져올 때는
@@ -139,5 +181,8 @@
 실행 진입점을 분리한 구조입니다.
 
 벽면 수음점용 `building_buffer`는 기준 `building_simplified`에 1m 외곽
-버퍼만 적용한 파생 레이어입니다. `main.py` 실행 시 지붕 수음점 전처리는
-이 버퍼와 `input_files.building_height_gpkg`의 원본 형상을 함께 사용합니다.
+버퍼만 적용한 파생 레이어입니다. 지붕 수음점은 버퍼가 아닌
+`building_simplified`를 직사각형도 0.95까지 분할한 뒤, 좁은 자투리를 병합하고
+각 조각의 MRR을 외벽 수음점과 같은 나머지 길이 규칙으로 격자화해 배치합니다.
+서로 다른 MRR의 셀이 겹치고 후보점 간 거리가 해상도의 절반보다 짧으면 지붕
+유효면적이 작은 후보를 제거하되, 10m 지붕 커버리지에 공백이 생기면 복원합니다.

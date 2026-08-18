@@ -1,18 +1,27 @@
 {
-  "min_x": 1145000,
-  "max_x": 1146000,
-  "min_y": 1735000,
-  "max_y": 1736000,
-  "resolution_m": 10.0,
-  "grid_size_m": 100.0,
+  "area": {
+    "min_x": 1145000,
+    "max_x": 1148000,
+    "min_y": 1735000,
+    "max_y": 1738000
+  },
+  "grid": {
+    "resolution_m": 10.0,
+    "grid_size_m": 100.0
+  },
+  "parallel_processing": {
+    "workers": 24,
+    "building_chunk_size": 32,
+    "ground_factor_chunk_size": 1000,
+    "terrain_chunk_size": 1000
+  },
   "terrain_idw": {
     "search_radius_m": 800.0,
     "max_search_radius_m": 2000.0,
     "min_contours": 4,
     "max_contours": 8,
     "min_elevation_levels": 2,
-    "workers": 8,
-    "chunk_size": 2000
+    "contour_simplify_tolerance_m": 2.0
   },
   "output_filename": {
     "prefix": "cropped_",

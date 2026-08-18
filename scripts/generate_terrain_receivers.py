@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
@@ -8,12 +9,14 @@ import pyogrio
 import shapely
 
 from pyproj import CRS, Transformer
+from scipy.spatial import cKDTree
 from shapely.geometry import box
 from shapely.strtree import STRtree
 
 try:
     from scripts.pipeline_common import (
         get_env_float,
+        get_env_bool,
         get_env_int,
         get_env_path,
         validate_bounds,
@@ -24,6 +27,7 @@ try:
 except ModuleNotFoundError:
     from pipeline_common import (
         get_env_float,
+        get_env_bool,
         get_env_int,
         get_env_path,
         validate_bounds,
@@ -54,6 +58,10 @@ output_csv_path = get_env_path(
     "TERRAIN_RECEIVER_OUTPUT_CSV",
     project_dir / "receivers/terrain/cropped_terrain_receivers_center.csv",
 )
+input_building_metadata_gpkg_path = get_env_path(
+    "BUILDING_METADATA_INPUT_GPKG",
+    project_dir / "metadata/building/building_cropped_metadata.gpkg",
+)
 
 land_cover_layer_name = "land_cover_map"
 land_cover_code_field = "L2_CODE"
@@ -70,8 +78,15 @@ min_y = get_env_float("RECEIVER_MIN_Y", 1732000)
 max_y = get_env_float("RECEIVER_MAX_Y", 1733000)
 
 receiver_height_m = 1.5
+building_layer_name = "building_simplified"
+building_base_elevation_field = "BLDH_MN"
+has_buildings = get_env_bool("RECEIVER_HAS_BUILDINGS", True)
 
-spatial_chunk_size = 100_000
+parallel_workers = get_env_int("PARALLEL_WORKERS", 8)
+ground_factor_chunk_size = get_env_int(
+    "GROUND_FACTOR_CHUNK_SIZE",
+    20_000,
+)
 idw_search_radius_m = get_env_float(
     "TERRAIN_IDW_SEARCH_RADIUS_M",
     800.0,
@@ -86,14 +101,18 @@ idw_min_elevation_levels = get_env_int(
     "TERRAIN_IDW_MIN_ELEVATION_LEVELS",
     2,
 )
-idw_workers = get_env_int("TERRAIN_IDW_WORKERS", 8)
 contour_distance_chunk_size = get_env_int(
     "TERRAIN_IDW_CHUNK_SIZE",
     2_000,
 )
 idw_zero_distance_tolerance_m = 1.0e-9
 IDW_POWER = 2.0
-contour_simplify_tolerance_m = min(2.0, grid_m / 5.0)
+contour_simplify_tolerance_m = get_env_float(
+    "TERRAIN_IDW_CONTOUR_SIMPLIFY_TOLERANCE_M",
+    min(2.0, grid_m / 5.0),
+)
+
+minimum_building_constraint_area_m2 = 25.0
 
 save_debug_grid = False
 debug_grid_csv_path = project_dir / "receivers/terrain/debug_grid_10m.csv"
@@ -316,9 +335,248 @@ def assign_ground_factor_legacy(grid_df):
     return result
 
 
-def assign_ground_factor(grid_df):
+def calculate_ground_factor_chunk(
+    chunk_no,
+    start,
+    end,
+    grid_x,
+    grid_y,
+    land_tree,
+    land_geometries,
+    land_boundaries,
+    land_factors,
+):
+    """단일 수음점 묶음의 지면계수 반환"""
     half_grid_m = grid_m / 2.0
     cell_area = grid_m * grid_m
+    boundary_search_distance = half_grid_m * np.sqrt(2.0)
+    chunk_length = end - start
+    chunk_factors = np.full(chunk_length, np.nan, dtype=float)
+    points = shapely.points(grid_x[start:end], grid_y[start:end])
+    center_bbox_pairs = land_tree.query(points)
+    center_bbox_cell_ids = center_bbox_pairs[0]
+    center_bbox_land_ids = center_bbox_pairs[1]
+    center_inside = shapely.contains(
+        land_geometries[center_bbox_land_ids],
+        points[center_bbox_cell_ids],
+    )
+    center_cell_ids = center_bbox_cell_ids[center_inside]
+    center_land_ids = center_bbox_land_ids[center_inside]
+    center_count = np.bincount(
+        center_cell_ids,
+        minlength=chunk_length,
+    )
+    exact_required = center_count != 1
+
+    center_single_mask = center_count[center_cell_ids] == 1
+    center_single_cell_ids = center_cell_ids[center_single_mask]
+    center_single_land_ids = center_land_ids[center_single_mask]
+    center_boundary_distance = shapely.distance(
+        points[center_single_cell_ids],
+        land_boundaries[center_single_land_ids],
+    )
+    near_boundary = (
+        center_boundary_distance
+        <= boundary_search_distance + spatial_epsilon
+    )
+    exact_required[center_single_cell_ids[near_boundary]] = True
+    direct_ids = center_single_cell_ids[~near_boundary]
+    direct_land_ids = center_single_land_ids[~near_boundary]
+    chunk_factors[direct_ids] = land_factors[direct_land_ids]
+    direct_cell_count = len(direct_ids)
+
+    boundary_ids = np.flatnonzero(exact_required)
+    boundary_cells = shapely.box(
+        grid_x[start + boundary_ids] - half_grid_m,
+        grid_y[start + boundary_ids] - half_grid_m,
+        grid_x[start + boundary_ids] + half_grid_m,
+        grid_y[start + boundary_ids] + half_grid_m,
+    )
+    candidate_bbox_pairs = land_tree.query(boundary_cells)
+    candidate_bbox_boundary_ids = candidate_bbox_pairs[0]
+    candidate_bbox_land_ids = candidate_bbox_pairs[1]
+    candidate_intersects = shapely.intersects(
+        land_geometries[candidate_bbox_land_ids],
+        boundary_cells[candidate_bbox_boundary_ids],
+    )
+    boundary_pair_ids = candidate_bbox_boundary_ids[candidate_intersects]
+    candidate_land_ids = candidate_bbox_land_ids[candidate_intersects]
+    candidate_count = np.bincount(
+        boundary_pair_ids,
+        minlength=len(boundary_ids),
+    )
+    candidate_factor_min = np.full(len(boundary_ids), np.inf, dtype=float)
+    candidate_factor_max = np.full(len(boundary_ids), -np.inf, dtype=float)
+    np.minimum.at(
+        candidate_factor_min,
+        boundary_pair_ids,
+        land_factors[candidate_land_ids],
+    )
+    np.maximum.at(
+        candidate_factor_max,
+        boundary_pair_ids,
+        land_factors[candidate_land_ids],
+    )
+    resolved_boundary = np.zeros(len(boundary_ids), dtype=bool)
+
+    single_pair_mask = candidate_count[boundary_pair_ids] == 1
+    single_boundary_pair_ids = boundary_pair_ids[single_pair_mask]
+    single_land_ids = candidate_land_ids[single_pair_mask]
+    if len(single_boundary_pair_ids) > 0:
+        fully_covered = shapely.covers(
+            land_geometries[single_land_ids],
+            boundary_cells[single_boundary_pair_ids],
+        )
+        direct_boundary_ids = single_boundary_pair_ids[fully_covered]
+        direct_land_ids = single_land_ids[fully_covered]
+        direct_chunk_ids = boundary_ids[direct_boundary_ids]
+        chunk_factors[direct_chunk_ids] = land_factors[direct_land_ids]
+        resolved_boundary[direct_boundary_ids] = True
+        direct_cell_count += len(direct_boundary_ids)
+
+    same_factor_boundary_ids = np.flatnonzero(
+        (candidate_count > 1)
+        & (candidate_factor_min == candidate_factor_max)
+    )
+    same_factor_chunk_ids = boundary_ids[same_factor_boundary_ids]
+    chunk_factors[same_factor_chunk_ids] = candidate_factor_min[
+        same_factor_boundary_ids
+    ]
+    resolved_boundary[same_factor_boundary_ids] = True
+    direct_cell_count += len(same_factor_boundary_ids)
+
+    intersection_required = ~resolved_boundary
+    exact_pair_mask = intersection_required[boundary_pair_ids]
+    exact_pair_cell_ids = boundary_ids[boundary_pair_ids[exact_pair_mask]]
+    exact_pair_land_ids = candidate_land_ids[exact_pair_mask]
+    exact_ids = boundary_ids[intersection_required]
+    exact_cell_count = len(exact_ids)
+
+    covered_area = np.zeros(chunk_length, dtype=float)
+    weighted_factor = np.zeros(chunk_length, dtype=float)
+    if len(exact_pair_cell_ids) > 0:
+        intersection_area = shapely.area(
+            shapely.intersection(
+                shapely.box(
+                    grid_x[start + exact_pair_cell_ids] - half_grid_m,
+                    grid_y[start + exact_pair_cell_ids] - half_grid_m,
+                    grid_x[start + exact_pair_cell_ids] + half_grid_m,
+                    grid_y[start + exact_pair_cell_ids] + half_grid_m,
+                ),
+                land_geometries[exact_pair_land_ids],
+            )
+        )
+        positive_area = intersection_area > 0.0
+        area_cell_ids = exact_pair_cell_ids[positive_area]
+        area_land_ids = exact_pair_land_ids[positive_area]
+        area_values = intersection_area[positive_area]
+        covered_area += np.bincount(
+            area_cell_ids,
+            weights=area_values,
+            minlength=chunk_length,
+        )
+        weighted_factor += np.bincount(
+            area_cell_ids,
+            weights=area_values * land_factors[area_land_ids],
+            minlength=chunk_length,
+        )
+
+    exact_coverage = covered_area[exact_ids] / cell_area
+    invalid_exact = (
+        (exact_coverage < 1.0 - coverage_tolerance)
+        | (exact_coverage > 1.0 + coverage_tolerance)
+    )
+    if invalid_exact.any():
+        invalid_local_ids = exact_ids[invalid_exact]
+        invalid_global_ids = start + invalid_local_ids
+        example_lines = []
+        for local_id, global_id in zip(
+            invalid_local_ids[:10],
+            invalid_global_ids[:10],
+        ):
+            coverage_value = covered_area[local_id] / cell_area
+            status = "미피복" if coverage_value < 1.0 else "중복"
+            example_lines.append(
+                f" - cell={global_id}, "
+                f"x={grid_x[global_id]:.3f}, "
+                f"y={grid_y[global_id]:.3f}, "
+                f"상태={status}, 피복률={coverage_value:.6f}"
+            )
+        raise ValueError(
+            "토지피복도가 계산 격자를 완전히 채우지 못하거나 "
+            "중복됩니다.\n"
+            f"현재 묶음 오류 셀 수: {len(invalid_local_ids)}\n"
+            + "\n".join(example_lines)
+        )
+
+    chunk_factors[exact_ids] = (
+        weighted_factor[exact_ids] / covered_area[exact_ids]
+    )
+    return {
+        "chunk_no": chunk_no,
+        "start": start,
+        "end": end,
+        "factors": chunk_factors,
+        "direct_count": direct_cell_count,
+        "exact_count": exact_cell_count,
+    }
+
+
+def iterate_ground_factor_chunks(
+    chunk_ranges,
+    grid_x,
+    grid_y,
+    land_tree,
+    land_geometries,
+    land_boundaries,
+    land_factors,
+):
+    """설정된 작업 수에 따른 지면계수 묶음 결과 반환"""
+    def calculate(chunk_range):
+        chunk_no, start, end = chunk_range
+        return calculate_ground_factor_chunk(
+            chunk_no,
+            start,
+            end,
+            grid_x,
+            grid_y,
+            land_tree,
+            land_geometries,
+            land_boundaries,
+            land_factors,
+        )
+
+    if parallel_workers == 1:
+        for chunk_range in chunk_ranges:
+            yield calculate(chunk_range)
+        return
+
+    chunk_iterator = iter(chunk_ranges)
+    with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+        pending = {}
+        for _ in range(min(parallel_workers, len(chunk_ranges))):
+            chunk_range = next(chunk_iterator)
+            pending[executor.submit(calculate, chunk_range)] = chunk_range
+
+        while pending:
+            completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                pending.pop(future)
+                try:
+                    yield future.result()
+                except Exception:
+                    for pending_future in pending:
+                        pending_future.cancel()
+                    raise
+
+                next_chunk_range = next(chunk_iterator, None)
+                if next_chunk_range is not None:
+                    pending[
+                        executor.submit(calculate, next_chunk_range)
+                    ] = next_chunk_range
+
+
+def assign_ground_factor(grid_df):
     result_factors = np.full(len(grid_df), np.nan, dtype=float)
 
     land_cover_info = pyogrio.read_info(
@@ -373,211 +631,58 @@ def assign_ground_factor(grid_df):
     land_cover = land_cover.to_crs(receiver_crs)
     land_geometries = land_cover.geometry.to_numpy()
     land_factors = land_cover["_surface_factor"].to_numpy(dtype=float)
-    shapely.prepare(land_geometries)
     land_tree = STRtree(land_geometries)
     land_boundaries = shapely.boundary(land_geometries)
-    boundary_search_distance = half_grid_m * np.sqrt(2.0)
     grid_x = grid_df["x_epsg5179"].to_numpy(dtype=float)
     grid_y = grid_df["y_epsg5179"].to_numpy(dtype=float)
-    chunk_count = int(np.ceil(len(grid_df) / spatial_chunk_size))
+    effective_chunk_size = min(
+        ground_factor_chunk_size,
+        max(1, math.ceil(len(grid_df) / parallel_workers)),
+    )
+    chunk_ranges = [
+        (
+            chunk_no,
+            start,
+            min(start + effective_chunk_size, len(grid_df)),
+        )
+        for chunk_no, start in enumerate(
+            range(0, len(grid_df), effective_chunk_size),
+            start=1,
+        )
+    ]
+    chunk_count = len(chunk_ranges)
     direct_cell_count = 0
     exact_cell_count = 0
+    completed_cell_count = 0
 
     print("[지면계수 공간계산]")
     print(" - cell count:", len(grid_df))
     print(" - land cover polygons:", len(land_cover))
-    print(" - chunk size:", spatial_chunk_size)
+    print(" - workers:", parallel_workers)
+    print(" - chunk size:", effective_chunk_size)
 
-    for chunk_no, start in enumerate(
-        range(0, len(grid_df), spatial_chunk_size),
+    chunk_results = iterate_ground_factor_chunks(
+        chunk_ranges,
+        grid_x,
+        grid_y,
+        land_tree,
+        land_geometries,
+        land_boundaries,
+        land_factors,
+    )
+    for completed_chunk_count, chunk_result in enumerate(
+        chunk_results,
         start=1,
     ):
-        end = min(start + spatial_chunk_size, len(grid_df))
-        chunk_length = end - start
-        points = shapely.points(
-            grid_x[start:end],
-            grid_y[start:end],
-        )
-        center_bbox_pairs = land_tree.query(points)
-        center_bbox_cell_ids = center_bbox_pairs[0]
-        center_bbox_land_ids = center_bbox_pairs[1]
-        center_inside = shapely.contains(
-            land_geometries[center_bbox_land_ids],
-            points[center_bbox_cell_ids],
-        )
-        center_cell_ids = center_bbox_cell_ids[center_inside]
-        center_land_ids = center_bbox_land_ids[center_inside]
-        center_count = np.bincount(
-            center_cell_ids,
-            minlength=chunk_length,
-        )
-        exact_required = center_count != 1
-
-        center_single_mask = center_count[center_cell_ids] == 1
-        center_single_cell_ids = center_cell_ids[center_single_mask]
-        center_single_land_ids = center_land_ids[center_single_mask]
-        center_boundary_distance = shapely.distance(
-            points[center_single_cell_ids],
-            land_boundaries[center_single_land_ids],
-        )
-        near_boundary = (
-            center_boundary_distance
-            <= boundary_search_distance + spatial_epsilon
-        )
-        exact_required[
-            center_single_cell_ids[near_boundary]
-        ] = True
-        direct_mask = ~near_boundary
-        direct_ids = center_single_cell_ids[direct_mask]
-        direct_land_ids = center_single_land_ids[direct_mask]
-        result_factors[start + direct_ids] = land_factors[direct_land_ids]
-        direct_cell_count += len(direct_ids)
-
-        boundary_ids = np.flatnonzero(exact_required)
-        boundary_cells = shapely.box(
-            grid_x[start + boundary_ids] - half_grid_m,
-            grid_y[start + boundary_ids] - half_grid_m,
-            grid_x[start + boundary_ids] + half_grid_m,
-            grid_y[start + boundary_ids] + half_grid_m,
-        )
-        candidate_bbox_pairs = land_tree.query(boundary_cells)
-        candidate_bbox_boundary_ids = candidate_bbox_pairs[0]
-        candidate_bbox_land_ids = candidate_bbox_pairs[1]
-        candidate_intersects = shapely.intersects(
-            land_geometries[candidate_bbox_land_ids],
-            boundary_cells[candidate_bbox_boundary_ids],
-        )
-        boundary_pair_ids = candidate_bbox_boundary_ids[
-            candidate_intersects
-        ]
-        candidate_land_ids = candidate_bbox_land_ids[
-            candidate_intersects
-        ]
-        candidate_count = np.bincount(
-            boundary_pair_ids,
-            minlength=len(boundary_ids),
-        )
-        candidate_factor_min = np.full(
-            len(boundary_ids),
-            np.inf,
-            dtype=float,
-        )
-        candidate_factor_max = np.full(
-            len(boundary_ids),
-            -np.inf,
-            dtype=float,
-        )
-        np.minimum.at(
-            candidate_factor_min,
-            boundary_pair_ids,
-            land_factors[candidate_land_ids],
-        )
-        np.maximum.at(
-            candidate_factor_max,
-            boundary_pair_ids,
-            land_factors[candidate_land_ids],
-        )
-        resolved_boundary = np.zeros(len(boundary_ids), dtype=bool)
-
-        single_pair_mask = candidate_count[boundary_pair_ids] == 1
-        single_boundary_pair_ids = boundary_pair_ids[single_pair_mask]
-        single_land_ids = candidate_land_ids[single_pair_mask]
-        if len(single_boundary_pair_ids) > 0:
-            fully_covered = shapely.covers(
-                land_geometries[single_land_ids],
-                boundary_cells[single_boundary_pair_ids],
-            )
-            direct_boundary_ids = single_boundary_pair_ids[fully_covered]
-            direct_land_ids = single_land_ids[fully_covered]
-            direct_chunk_ids = boundary_ids[direct_boundary_ids]
-            result_factors[start + direct_chunk_ids] = land_factors[direct_land_ids]
-            resolved_boundary[direct_boundary_ids] = True
-            direct_cell_count += len(direct_boundary_ids)
-
-        same_factor_boundary_ids = np.flatnonzero(
-            (candidate_count > 1)
-            & (candidate_factor_min == candidate_factor_max)
-        )
-        same_factor_chunk_ids = boundary_ids[same_factor_boundary_ids]
-        result_factors[start + same_factor_chunk_ids] = candidate_factor_min[
-            same_factor_boundary_ids
-        ]
-        resolved_boundary[same_factor_boundary_ids] = True
-        direct_cell_count += len(same_factor_boundary_ids)
-
-        intersection_required = ~resolved_boundary
-        exact_pair_mask = intersection_required[boundary_pair_ids]
-        exact_pair_cell_ids = boundary_ids[
-            boundary_pair_ids[exact_pair_mask]
-        ]
-        exact_pair_land_ids = candidate_land_ids[exact_pair_mask]
-        exact_ids = boundary_ids[intersection_required]
-        exact_cell_count += len(exact_ids)
-
-        covered_area = np.zeros(chunk_length, dtype=float)
-        weighted_factor = np.zeros(chunk_length, dtype=float)
-        if len(exact_pair_cell_ids) > 0:
-            intersection_area = shapely.area(
-                shapely.intersection(
-                    shapely.box(
-                        grid_x[start + exact_pair_cell_ids] - half_grid_m,
-                        grid_y[start + exact_pair_cell_ids] - half_grid_m,
-                        grid_x[start + exact_pair_cell_ids] + half_grid_m,
-                        grid_y[start + exact_pair_cell_ids] + half_grid_m,
-                    ),
-                    land_geometries[exact_pair_land_ids],
-                )
-            )
-            positive_area = intersection_area > 0.0
-            area_cell_ids = exact_pair_cell_ids[positive_area]
-            area_land_ids = exact_pair_land_ids[positive_area]
-            area_values = intersection_area[positive_area]
-            covered_area += np.bincount(
-                area_cell_ids,
-                weights=area_values,
-                minlength=chunk_length,
-            )
-            weighted_factor += np.bincount(
-                area_cell_ids,
-                weights=area_values * land_factors[area_land_ids],
-                minlength=chunk_length,
-            )
-
-        exact_coverage = covered_area[exact_ids] / cell_area
-        invalid_exact = (
-            (exact_coverage < 1.0 - coverage_tolerance)
-            | (exact_coverage > 1.0 + coverage_tolerance)
-        )
-        if invalid_exact.any():
-            invalid_local_ids = exact_ids[invalid_exact]
-            invalid_global_ids = start + invalid_local_ids
-            example_lines = []
-            for local_id, global_id in zip(
-                invalid_local_ids[:10],
-                invalid_global_ids[:10],
-            ):
-                coverage_value = covered_area[local_id] / cell_area
-                status = "미피복" if coverage_value < 1.0 else "중복"
-                row = grid_df.iloc[global_id]
-                example_lines.append(
-                    f" - cell={global_id}, "
-                    f"x={row['x_epsg5179']:.3f}, "
-                    f"y={row['y_epsg5179']:.3f}, "
-                    f"상태={status}, 피복률={coverage_value:.6f}"
-                )
-            raise ValueError(
-                "토지피복도가 계산 격자를 완전히 채우지 못하거나 "
-                "중복됩니다.\n"
-                f"현재 묶음 오류 셀 수: {len(invalid_local_ids)}\n"
-                + "\n".join(example_lines)
-            )
-
-        result_factors[start + exact_ids] = (
-            weighted_factor[exact_ids] / covered_area[exact_ids]
-        )
+        start = chunk_result["start"]
+        end = chunk_result["end"]
+        result_factors[start:end] = chunk_result["factors"]
+        direct_cell_count += chunk_result["direct_count"]
+        exact_cell_count += chunk_result["exact_count"]
+        completed_cell_count += end - start
         print(
-            f" - chunk {chunk_no}/{chunk_count}: "
-            f"{end:,}/{len(grid_df):,}"
+            f" - completed chunks {completed_chunk_count}/{chunk_count}: "
+            f"{completed_cell_count:,}/{len(grid_df):,}"
         )
 
     if not np.isfinite(result_factors).all():
@@ -674,7 +779,14 @@ def read_contours(contour_path):
 # =========================
 # 등고선별 최근접 거리 계산 함수
 # =========================
-def query_nearest_contours(points, contour_tree, contours, elevations, radius):
+def query_nearest_contours(
+    points,
+    contour_tree,
+    contours,
+    elevations,
+    radius,
+    minimum_elevation_levels=0,
+):
     """반경 내 등고선별 최근접 거리 행렬 반환"""
     point_count = len(points)
     distance_matrix = np.full(
@@ -709,6 +821,100 @@ def query_nearest_contours(points, contour_tree, contours, elevations, radius):
     point_ids = point_ids[order]
     contour_ids = contour_ids[order]
     distances = distances[order]
+
+    if minimum_elevation_levels > 1:
+        candidate_elevations = elevations[contour_ids]
+        level_order = np.lexsort((
+            distances,
+            candidate_elevations,
+            point_ids,
+        ))
+        level_point_ids = point_ids[level_order]
+        level_elevations = candidate_elevations[level_order]
+        new_level = np.r_[
+            True,
+            (level_point_ids[1:] != level_point_ids[:-1])
+            | (
+                np.abs(level_elevations[1:] - level_elevations[:-1])
+                > 1.0e-6
+            ),
+        ]
+        representative_ids = level_order[new_level]
+        representative_order = np.lexsort((
+            contour_ids[representative_ids],
+            distances[representative_ids],
+            point_ids[representative_ids],
+        ))
+        representative_ids = representative_ids[representative_order]
+        representative_point_ids = point_ids[representative_ids]
+        representative_group_starts = np.flatnonzero(
+            np.r_[
+                True,
+                representative_point_ids[1:]
+                != representative_point_ids[:-1],
+            ]
+        )
+        representative_ranks = np.arange(len(representative_ids)) - np.repeat(
+            representative_group_starts,
+            np.diff(np.r_[representative_group_starts, len(representative_ids)]),
+        )
+        selected_representative_mask = (
+            representative_ranks < minimum_elevation_levels
+        )
+        selected_representative_ids = representative_ids[
+            selected_representative_mask
+        ]
+        selected_representative_point_ids = point_ids[
+            selected_representative_ids
+        ]
+        selected_representative_ranks = representative_ranks[
+            selected_representative_mask
+        ]
+        representative_counts = np.bincount(
+            selected_representative_point_ids,
+            minlength=point_count,
+        )
+
+        fill_mask = np.ones(len(point_ids), dtype=bool)
+        fill_mask[selected_representative_ids] = False
+        fill_ids = np.flatnonzero(fill_mask)
+        fill_point_ids = point_ids[fill_ids]
+        fill_group_starts = np.flatnonzero(
+            np.r_[True, fill_point_ids[1:] != fill_point_ids[:-1]]
+        )
+        fill_ranks = np.arange(len(fill_ids)) - np.repeat(
+            fill_group_starts,
+            np.diff(np.r_[fill_group_starts, len(fill_ids)]),
+        )
+        selected_fill_mask = fill_ranks < (
+            idw_max_contours - representative_counts[fill_point_ids]
+        )
+        selected_fill_ids = fill_ids[selected_fill_mask]
+        selected_fill_point_ids = fill_point_ids[selected_fill_mask]
+        selected_fill_ranks = fill_ranks[selected_fill_mask]
+
+        selected_candidate_ids = np.concatenate([
+            selected_representative_ids,
+            selected_fill_ids,
+        ])
+        selected_point_ids = np.concatenate([
+            selected_representative_point_ids,
+            selected_fill_point_ids,
+        ])
+        selected_ranks = np.concatenate([
+            selected_representative_ranks,
+            representative_counts[selected_fill_point_ids]
+            + selected_fill_ranks,
+        ])
+        selected_contour_ids = contour_ids[selected_candidate_ids]
+        distance_matrix[selected_point_ids, selected_ranks] = distances[
+            selected_candidate_ids
+        ]
+        elevation_matrix[selected_point_ids, selected_ranks] = elevations[
+            selected_contour_ids
+        ]
+        return distance_matrix, elevation_matrix
+
     group_starts = np.flatnonzero(
         np.r_[True, point_ids[1:] != point_ids[:-1]]
     )
@@ -727,6 +933,68 @@ def query_nearest_contours(points, contour_tree, contours, elevations, radius):
         selected_contour_ids
     ]
     return distance_matrix, elevation_matrix
+
+
+def query_idw_sources(
+    points,
+    contour_tree,
+    contours,
+    contour_elevations,
+    radius,
+    building_tree=None,
+    building_geometries=None,
+    building_elevations=None,
+):
+    """등고선과 건물 폴리곤을 합쳐 가까운 IDW 입력을 반환한다."""
+    contour_distances, contour_z = query_nearest_contours(
+        points,
+        contour_tree,
+        contours,
+        contour_elevations,
+        radius,
+        idw_min_elevation_levels,
+    )
+    if building_tree is None or len(building_geometries) == 0:
+        return contour_distances, contour_z
+
+    building_distances, building_z = query_nearest_contours(
+        points,
+        building_tree,
+        building_geometries,
+        building_elevations,
+        radius,
+    )
+    reserved_contour_count = min(
+        max(idw_min_contours, idw_min_elevation_levels),
+        idw_max_contours,
+    )
+    reserved_distances = contour_distances[:, :reserved_contour_count]
+    reserved_elevations = contour_z[:, :reserved_contour_count]
+    remaining_count = idw_max_contours - reserved_contour_count
+    if remaining_count == 0:
+        return reserved_distances, reserved_elevations
+
+    optional_distances = np.concatenate([
+        contour_distances[:, reserved_contour_count:],
+        building_distances,
+    ], axis=1)
+    optional_elevations = np.concatenate([
+        contour_z[:, reserved_contour_count:],
+        building_z,
+    ], axis=1)
+    nearest_columns = np.argsort(optional_distances, axis=1, kind="stable")[
+        :, :remaining_count
+    ]
+    return (
+        np.concatenate([
+            reserved_distances,
+            np.take_along_axis(optional_distances, nearest_columns, axis=1),
+        ], axis=1),
+        np.concatenate([
+            reserved_elevations,
+            np.take_along_axis(optional_elevations, nearest_columns, axis=1),
+        ], axis=1),
+    )
 
 
 def count_elevation_levels(elevation_matrix):
@@ -761,7 +1029,7 @@ def calculate_neighbor_idw(distance_matrix, elevation_matrix, receiver_xy):
         exact_elevations = elevation_matrix[row_id, exact_mask[row_id]]
         if exact_elevations.max() - exact_elevations.min() > 1.0e-6:
             raise ValueError(
-                "수음점과 교차하는 등고선의 표고가 서로 다릅니다.\n"
+                "수음점과 교차하는 IDW 입력 객체의 표고가 서로 다릅니다.\n"
                 f"좌표: x={receiver_xy[row_id, 0]:.3f}, "
                 f"y={receiver_xy[row_id, 1]:.3f}\n"
                 f"표고: {exact_elevations.tolist()}"
@@ -799,6 +1067,9 @@ def calculate_contour_idw_chunk(
     contour_tree,
     contours,
     elevations,
+    building_tree=None,
+    building_geometries=None,
+    building_elevations=None,
 ):
     """단일 수음점 묶음의 IDW 계산 결과 반환"""
     receiver_coordinates = np.column_stack([
@@ -809,12 +1080,15 @@ def calculate_contour_idw_chunk(
         receiver_coordinates[:, 0],
         receiver_coordinates[:, 1],
     )
-    distance_matrix, elevation_matrix = query_nearest_contours(
+    distance_matrix, elevation_matrix = query_idw_sources(
         receiver_points,
         contour_tree,
         contours,
         elevations,
         idw_search_radius_m,
+        building_tree,
+        building_geometries,
+        building_elevations,
     )
     valid_mask = np.isfinite(distance_matrix)
     contour_counts = valid_mask.sum(axis=1)
@@ -829,12 +1103,15 @@ def calculate_contour_idw_chunk(
     )
 
     if fallback_rows.any():
-        fallback_distances, fallback_elevations = query_nearest_contours(
+        fallback_distances, fallback_elevations = query_idw_sources(
             receiver_points[fallback_rows],
             contour_tree,
             contours,
             elevations,
             idw_max_search_radius_m,
+            building_tree,
+            building_geometries,
+            building_elevations,
         )
         distance_matrix[fallback_rows] = fallback_distances
         elevation_matrix[fallback_rows] = fallback_elevations
@@ -854,14 +1131,14 @@ def calculate_contour_idw_chunk(
                 f" - cell={global_id}, "
                 f"x={recv_x[global_id]:.3f}, "
                 f"y={recv_y[global_id]:.3f}, "
-                f"등고선={contour_counts[local_id]}, "
+                f"입력 객체={contour_counts[local_id]}, "
                 f"표고 단계={elevation_level_counts[local_id]}"
             )
         raise ValueError(
-            "IDW 최대 반경 안에서 최소 등고선 조건을 "
+            "IDW 최대 반경 안에서 최소 입력 조건을 "
             "충족하지 못했습니다.\n"
             f"최대 반경: {idw_max_search_radius_m:.1f}m\n"
-            f"최소 등고선 개수: {idw_min_contours}\n"
+            f"최소 입력 객체 수: {idw_min_contours}\n"
             f"최소 표고 단계 수: {idw_min_elevation_levels}\n"
             f"실패 수음점 수: {int(insufficient_mask.sum()):,}\n"
             + "\n".join(example_lines)
@@ -910,6 +1187,9 @@ def iterate_contour_idw_chunks(
     contour_tree,
     contours,
     elevations,
+    building_tree=None,
+    building_geometries=None,
+    building_elevations=None,
 ):
     """설정된 작업 수에 따른 IDW 묶음 결과 반환"""
     def calculate(chunk_range):
@@ -923,17 +1203,20 @@ def iterate_contour_idw_chunks(
             contour_tree,
             contours,
             elevations,
+            building_tree,
+            building_geometries,
+            building_elevations,
         )
 
-    if idw_workers == 1:
+    if parallel_workers == 1:
         for chunk_range in chunk_ranges:
             yield calculate(chunk_range)
         return
 
     chunk_iterator = iter(chunk_ranges)
-    with ThreadPoolExecutor(max_workers=idw_workers) as executor:
+    with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
         pending = {}
-        for _ in range(min(idw_workers, len(chunk_ranges))):
+        for _ in range(min(parallel_workers, len(chunk_ranges))):
             chunk_range = next(chunk_iterator)
             pending[executor.submit(calculate, chunk_range)] = chunk_range
 
@@ -958,20 +1241,33 @@ def iterate_contour_idw_chunks(
 # =========================
 # 적응형 등고선 IDW 고도 계산 함수
 # =========================
-def calculate_contour_idw_ground_z(contours, elevations, grid_df):
-    """기준 반경과 최소 등고선 조건 기반 IDW 고도 계산"""
+def calculate_contour_idw_ground_z(
+    contours,
+    elevations,
+    grid_df,
+    building_geometries=None,
+    building_elevations=None,
+):
+    """등고선과 선택적 건물 폴리곤을 사용한 IDW 고도 계산"""
     recv_x = grid_df["x_epsg5179"].to_numpy(dtype=float)
     recv_y = grid_df["y_epsg5179"].to_numpy(dtype=float)
     contour_tree = STRtree(contours)
+    building_tree = None
+    if building_geometries is not None and len(building_geometries) > 0:
+        building_tree = STRtree(building_geometries)
     ground_z = np.full(len(grid_df), np.nan, dtype=float)
+    effective_chunk_size = min(
+        contour_distance_chunk_size,
+        max(1, math.ceil(len(grid_df) / parallel_workers)),
+    )
     chunk_ranges = [
         (
             chunk_no,
             start,
-            min(start + contour_distance_chunk_size, len(grid_df)),
+            min(start + effective_chunk_size, len(grid_df)),
         )
         for chunk_no, start in enumerate(
-            range(0, len(grid_df), contour_distance_chunk_size),
+            range(0, len(grid_df), effective_chunk_size),
             start=1,
         )
     ]
@@ -987,16 +1283,21 @@ def calculate_contour_idw_ground_z(contours, elevations, grid_df):
     maximum_used_distance = 0.0
     completed_receiver_count = 0
 
-    print("[적응형 등고선 IDW 지면고도]")
+    print("[적응형 등고선 + 건물 폴리곤 IDW 지면고도]")
     print(" - receivers:", len(grid_df))
+    print(" - contour sources:", len(contours))
+    print(
+        " - building polygon sources:",
+        0 if building_geometries is None else len(building_geometries),
+    )
     print(" - reference radius:", idw_search_radius_m, "m")
     print(" - maximum radius:", idw_max_search_radius_m, "m")
     print(" - minimum contours:", idw_min_contours)
     print(" - maximum contours:", idw_max_contours)
     print(" - minimum elevation levels:", idw_min_elevation_levels)
     print(" - power:", IDW_POWER)
-    print(" - workers:", idw_workers)
-    print(" - chunk size:", contour_distance_chunk_size)
+    print(" - workers:", parallel_workers)
+    print(" - chunk size:", effective_chunk_size)
 
     chunk_results = iterate_contour_idw_chunks(
         chunk_ranges,
@@ -1005,6 +1306,9 @@ def calculate_contour_idw_ground_z(contours, elevations, grid_df):
         contour_tree,
         contours,
         elevations,
+        building_tree,
+        building_geometries,
+        building_elevations,
     )
     for completed_chunk_count, result in enumerate(chunk_results, start=1):
         start = result["start"]
@@ -1051,7 +1355,7 @@ def calculate_contour_idw_ground_z(contours, elevations, grid_df):
     print(" - exact contour points:", exact_receiver_count)
     print(" - expanded-radius receivers:", fallback_receiver_count)
     print(
-        " - selected contours min/mean/max:",
+        " - selected sources min/mean/max:",
         selected_contour_minimum,
         f"{selected_contour_total / len(grid_df):.1f}",
         selected_contour_maximum,
@@ -1069,15 +1373,107 @@ def calculate_contour_idw_ground_z(contours, elevations, grid_df):
 
 
 # =========================
-# 수음점 생성 함수
+# 메인 IDW + 건물 폴리곤 마스킹 함수
 # =========================
+def read_building_mask():
+    """마스크 및 BLDH_MN IDW 입력으로 사용할 건물 폴리곤을 읽는다."""
+    if not has_buildings:
+        return None, np.empty(0, dtype=object), np.empty(0, dtype=float)
+
+    buildings = gpd.read_file(
+        input_building_metadata_gpkg_path,
+        layer=building_layer_name,
+        bbox=(min_x, min_y, max_x, max_y),
+    )
+    if buildings.crs is None:
+        raise ValueError("건물 마스크 데이터에 CRS가 없습니다.")
+    if buildings.crs.to_epsg() != 5179:
+        buildings = buildings.to_crs(receiver_crs)
+
+    valid = buildings.geometry.notna() & ~buildings.geometry.is_empty
+    if "Shape_Area" in buildings.columns:
+        buildings["Shape_Area"] = pd.to_numeric(
+            buildings["Shape_Area"],
+            errors="coerce",
+        )
+        valid &= buildings["Shape_Area"] >= minimum_building_constraint_area_m2
+    buildings = buildings.loc[valid].copy()
+    if buildings.empty:
+        raise ValueError("마스킹에 사용할 유효한 건물 폴리곤이 없습니다.")
+
+    building_union = shapely.union_all(buildings.geometry.to_numpy())
+    if building_union.is_empty:
+        raise ValueError("건물 폴리곤 마스크를 생성하지 못했습니다.")
+
+    if building_base_elevation_field not in buildings.columns:
+        raise ValueError(
+            "건물 폴리곤에 지반고 필드가 없습니다: "
+            f"{building_base_elevation_field}"
+        )
+    buildings[building_base_elevation_field] = pd.to_numeric(
+        buildings[building_base_elevation_field],
+        errors="coerce",
+    )
+    elevation_valid = np.isfinite(buildings[building_base_elevation_field])
+    idw_buildings = buildings.loc[elevation_valid].copy()
+    if idw_buildings.empty:
+        raise ValueError("IDW 입력으로 사용할 유효한 건물 지반고가 없습니다.")
+
+    building_geometries = idw_buildings.geometry.to_numpy()
+    building_elevations = idw_buildings[
+        building_base_elevation_field
+    ].to_numpy(dtype=float)
+    print("[IDW 건물 폴리곤 입력]")
+    print(" - layer:", building_layer_name)
+    print(" - masking polygons:", len(buildings))
+    print(" - BLDH_MN interpolation polygons:", len(idw_buildings))
+    print(
+        " - BLDH_MN min/max:",
+        building_elevations.min(),
+        building_elevations.max(),
+    )
+    return building_union, building_geometries, building_elevations
+
+
+def mask_grid_by_buildings(grid_df, building_union):
+    """건물 폴리곤 내부 또는 경계의 격자 중심점을 제거한다."""
+    if building_union is None:
+        print("[IDW 건물 폴리곤 마스킹]")
+        print(" - removed: 0")
+        print(" - remaining:", len(grid_df))
+        return grid_df.reset_index(drop=True)
+
+    points = shapely.points(
+        grid_df["x_epsg5179"].to_numpy(dtype=float),
+        grid_df["y_epsg5179"].to_numpy(dtype=float),
+    )
+    inside_or_boundary = shapely.covers(building_union, points)
+    result = grid_df.loc[~inside_or_boundary].reset_index(drop=True)
+    print("[IDW 건물 폴리곤 마스킹]")
+    print(" - before:", len(grid_df))
+    print(
+        " - removed inside or on boundary:",
+        int(np.count_nonzero(inside_or_boundary)),
+    )
+    print(" - remaining:", len(result))
+    return result
+
+
 def make_terrain_receivers():
-    grid_df = assign_ground_factor(make_grid())
+    (
+        building_union,
+        building_geometries,
+        building_elevations,
+    ) = read_building_mask()
+    grid_df = mask_grid_by_buildings(make_grid(), building_union)
+    grid_df = assign_ground_factor(grid_df)
     contours, elevations = read_contours(input_contour_path)
     ground_z = calculate_contour_idw_ground_z(
         contours,
         elevations,
         grid_df,
+        building_geometries,
+        building_elevations,
     )
 
     receivers = grid_df.copy()
@@ -1090,31 +1486,33 @@ def make_terrain_receivers():
 def main():
     validate_bounds(min_x, max_x, min_y, max_y)
     validate_positive(grid_m, "지면 수음점 해상도")
-    validate_positive(idw_search_radius_m, "IDW 기준 반경")
-    validate_positive(idw_max_search_radius_m, "IDW 최대 반경")
-    validate_positive(idw_min_contours, "IDW 최소 등고선 개수")
-    validate_positive(idw_max_contours, "IDW 최대 등고선 개수")
-    validate_positive(
-        idw_min_elevation_levels,
-        "IDW 최소 표고 단계 수",
-    )
-    validate_positive(idw_workers, "IDW 병렬 작업 수")
-    validate_positive(contour_distance_chunk_size, "IDW 묶음 크기")
+    validate_positive(parallel_workers, "공통 병렬 작업 수")
+    validate_positive(ground_factor_chunk_size, "지면계수 묶음 크기")
+    validate_positive(idw_search_radius_m, "IDW 기준 탐색 반경")
+    validate_positive(idw_max_search_radius_m, "IDW 최대 탐색 반경")
     if idw_search_radius_m > idw_max_search_radius_m:
-        raise ValueError("IDW 기준 반경은 최대 반경보다 클 수 없습니다.")
+        raise ValueError("IDW 기준 탐색 반경은 최대 탐색 반경 이하여야 합니다.")
+    validate_positive(idw_min_contours, "IDW 최소 등고선 수")
+    validate_positive(idw_max_contours, "IDW 최대 등고선 수")
     if idw_min_contours > idw_max_contours:
-        raise ValueError(
-            "IDW 최소 등고선 개수는 최대 등고선 개수보다 클 수 없습니다."
-        )
+        raise ValueError("IDW 최소 등고선 수는 최대 등고선 수 이하여야 합니다.")
+    validate_positive(idw_min_elevation_levels, "IDW 최소 표고 단계 수")
     if idw_min_elevation_levels > idw_max_contours:
-        raise ValueError(
-            "IDW 최소 표고 단계 수는 최대 등고선 개수보다 클 수 없습니다."
-        )
-    validate_input_paths([
+        raise ValueError("IDW 최소 표고 단계 수는 최대 등고선 수 이하여야 합니다.")
+    if contour_simplify_tolerance_m < 0:
+        raise ValueError("IDW 등고선 단순화 허용오차는 0 이상이어야 합니다.")
+    validate_positive(
+        contour_distance_chunk_size,
+        "IDW 보간 묶음 크기",
+    )
+    required_input_paths = [
         input_contour_path,
         input_land_cover_path,
         ground_factor_mapping_path,
-    ])
+    ]
+    if has_buildings:
+        required_input_paths.append(input_building_metadata_gpkg_path)
+    validate_input_paths(required_input_paths)
     area_bounds = (min_x, min_y, max_x, max_y)
     validate_spatial_file_coverage(
         path=input_land_cover_path,

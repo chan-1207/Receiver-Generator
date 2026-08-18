@@ -1,14 +1,25 @@
 from pathlib import Path
 
 import geopandas as gpd
-import pandas as pd
 from shapely.geometry import MultiPolygon, Polygon
 from shapely.validation import make_valid
 
 try:
-    from scripts.pipeline_common import get_env_path, validate_input_paths
+    from scripts.pipeline_common import (
+        get_env_int,
+        get_env_path,
+        parallel_map_ordered,
+        validate_input_paths,
+        validate_positive,
+    )
 except ModuleNotFoundError:
-    from pipeline_common import get_env_path, validate_input_paths
+    from pipeline_common import (
+        get_env_int,
+        get_env_path,
+        parallel_map_ordered,
+        validate_input_paths,
+        validate_positive,
+    )
 
 # =========================
 # 설정값
@@ -38,8 +49,8 @@ keep_cols = [
 
 receiver_offset_m = 1.0     # 최종 수음점용 외곽 버퍼 [m]
 
-area_col = "Shape_Area"
-min_area_m2 = 25.0          # 모폴로지 연산 전 건물 면적 필터 기준 [m2]
+parallel_workers = get_env_int("PARALLEL_WORKERS", 8)
+building_chunk_size = get_env_int("BUILDING_CHUNK_SIZE", 250)
 
 
 # =========================
@@ -86,6 +97,8 @@ def make_receiver_buffer(geom):
 
 
 def main():
+    validate_positive(parallel_workers, "공통 병렬 작업 수")
+    validate_positive(building_chunk_size, "건물 묶음 크기")
     validate_input_paths([input_building_metadata_path])
 
     # =========================
@@ -121,24 +134,15 @@ def main():
 
     gdf = simplified_gdf[keep_cols + ["geometry"]].copy()
 
-    # 건물 데이터 명시 면적 기준 소형 건물 제거
-    gdf[area_col] = pd.to_numeric(gdf[area_col], errors="coerce")
-    input_row_count = len(gdf)
-    gdf = gdf[
-        gdf[area_col].notna()
-        & (gdf[area_col] >= min_area_m2)
-    ].copy()
-
-    print("[2] 건물 면적 사전 필터")
-    print(" - area column:", area_col)
-    print(" - minimum area [m2]:", min_area_m2)
-    print(" - removed rows:", input_row_count - len(gdf))
-    print(" - remaining rows:", len(gdf))
-
-    print("[3] 수음점용 외곽 버퍼 처리 시작")
+    print("[2] 수음점용 외곽 버퍼 처리 시작")
+    print(" - parallel workers:", parallel_workers)
+    print(" - maximum chunk size:", building_chunk_size)
     buffer_gdf = gdf.copy()
-    buffer_gdf["geometry"] = buffer_gdf.geometry.apply(
-        make_receiver_buffer
+    buffer_gdf["geometry"] = parallel_map_ordered(
+        make_receiver_buffer,
+        buffer_gdf.geometry,
+        parallel_workers,
+        building_chunk_size,
     )
     buffer_gdf = buffer_gdf[
         buffer_gdf.geometry.notnull()
@@ -156,7 +160,7 @@ def main():
         layer=output_layer_name,
         index=False,
     )
-    print("[4] 저장 완료")
+    print("[3] 저장 완료")
     print(" - output:", output_gpkg_path)
     print(" - buffer layer:", output_layer_name)
     print(" - buffer rows:", len(buffer_gdf))

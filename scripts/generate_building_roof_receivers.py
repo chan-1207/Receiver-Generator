@@ -6,14 +6,16 @@ import numpy as np
 import pandas as pd
 from pyproj import Transformer
 from shapely.affinity import rotate
-from shapely.geometry import LineString, Point
-from shapely.ops import split
+from shapely.geometry import LineString, Point, box
+from shapely.ops import split, unary_union
 from shapely.validation import make_valid
 
 try:
     from scripts.pipeline_common import (
         get_env_float,
+        get_env_int,
         get_env_path,
+        parallel_map_ordered,
         validate_bounds,
         validate_input_paths,
         validate_positive,
@@ -21,7 +23,9 @@ try:
 except ModuleNotFoundError:
     from pipeline_common import (
         get_env_float,
+        get_env_int,
         get_env_path,
+        parallel_map_ordered,
         validate_bounds,
         validate_input_paths,
         validate_positive,
@@ -33,30 +37,21 @@ except ModuleNotFoundError:
 # =========================
 project_dir = Path(__file__).resolve().parents[1]
 
-input_building_buffer_gpkg_path = get_env_path(
-    "RECEIVER_BUFFER_INPUT_GPKG",
-    project_dir / "receivers/building/cropped_building_buffers_10m.gpkg",
-)
-input_original_building_gpkg_path = get_env_path(
-    "BUILDING_ORIGINAL_INPUT_GPKG",
-    project_dir / "data/building_height/building_height.gpkg",
+input_building_metadata_gpkg_path = get_env_path(
+    "BUILDING_METADATA_INPUT_GPKG",
+    project_dir / "metadata/building/building_metadata.gpkg",
 )
 output_csv_path = get_env_path(
     "ROOF_RECEIVER_OUTPUT_CSV",
     project_dir / "receivers/building/cropped_building_roof_receivers.csv",
 )
 
-input_buffer_layer_name = "building_buffer"
-input_original_building_layer_name = "TN_BULD"
+input_building_layer_name = "building_simplified"
 
 id_col = "NF_ID"
 top_col = "BLDH_BV"
-area_col = "Shape_Area"
-
-min_building_area_m2 = 25.0
 
 roof_resolution_m = get_env_float("RECEIVER_RESOLUTION_M", 10.0)
-roof_inset_m = roof_resolution_m / 2
 roof_height_offset_m = 1.0
 
 min_x = get_env_float("RECEIVER_MIN_X", 1163000)
@@ -64,9 +59,11 @@ max_x = get_env_float("RECEIVER_MAX_X", 1164000)
 min_y = get_env_float("RECEIVER_MIN_Y", 1732000)
 max_y = get_env_float("RECEIVER_MAX_Y", 1733000)
 
-rectangularity_threshold = 0.8
+rectangularity_threshold = 0.95
 max_split_depth = 5
 min_piece_area_m2 = 15.0
+parallel_workers = get_env_int("PARALLEL_WORKERS", 8)
+building_chunk_size = get_env_int("BUILDING_CHUNK_SIZE", 250)
 
 
 # =========================
@@ -331,50 +328,407 @@ def get_geometric_center(geom):
     return largest_part.representative_point()
 
 
-def get_centered_axis_values(min_value, max_value, resolution):
-    """범위 중심 기준 등간격 좌표 생성"""
-    center = (min_value + max_value) / 2.0
-    half_length = (max_value - min_value) / 2.0
-    step_count = math.floor(half_length / resolution)
+def get_section_count(length, resolution):
+    """외벽 수음점과 같은 나머지 길이 기준으로 구간 수 결정"""
+    if resolution <= 0:
+        raise ValueError("지붕 격자 해상도는 0보다 커야 합니다.")
 
-    # 사각형 중심을 기준으로 양쪽에 정확한 간격으로 후보점을 배치한다.
-    offsets = np.arange(-step_count, step_count + 1) * resolution
+    full_section_count, remainder = divmod(length, resolution)
+    section_count = int(full_section_count)
 
-    return center + offsets
+    if remainder > resolution / 2:
+        section_count += 1
+
+    return max(1, section_count)
 
 
-def make_oriented_grid_candidates(poly, resolution):
-    """폴리곤 주 방향 격자 후보점 생성"""
+def get_piece_frame(piece):
+    """분할 조각을 MRR 축에 맞춘 로컬 좌표계로 변환"""
+    rectangle = piece.minimum_rotated_rectangle
+    edges = get_rectangle_edges(piece)
+    start, end = max(edges, key=lambda edge: LineString(edge).length)
+    angle = math.atan2(end[1] - start[1], end[0] - start[0])
+    origin = (rectangle.centroid.x, rectangle.centroid.y)
+    local_piece = rotate(piece, -angle, origin=origin, use_radians=True)
+    local_rectangle = rotate(
+        rectangle,
+        -angle,
+        origin=origin,
+        use_radians=True,
+    )
+    return rectangle, local_piece, local_rectangle, angle, origin
+
+
+def get_mrr_metrics(piece):
+    """MRR 장변·단변·장축 방향 반환"""
+    edge_values = []
+
+    for start, end in get_rectangle_edges(piece):
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        edge_values.append((math.hypot(dx, dy), math.atan2(dy, dx)))
+
+    long_side, angle = max(edge_values, key=lambda item: item[0])
+    short_side = min(length for length, _ in edge_values)
+    return long_side, short_side, angle
+
+
+def angle_difference(first, second):
+    """180도 대칭을 고려한 두 MRR 축의 각도 차이"""
+    difference = abs(first - second) % math.pi
+    return min(difference, math.pi - difference)
+
+
+def make_piece_cell_records(piece, piece_no, resolution):
+    """MRR을 외벽 구간 규칙으로 분할하고 유효 셀마다 후보 생성"""
+    rectangle, local_piece, local_rectangle, angle, origin = get_piece_frame(piece)
+    min_local_x, min_local_y, max_local_x, max_local_y = local_rectangle.bounds
+    width = max_local_x - min_local_x
+    height = max_local_y - min_local_y
+    column_count = get_section_count(width, resolution)
+    row_count = get_section_count(height, resolution)
+    cell_width = width / column_count
+    cell_height = height / row_count
+    records = []
+
+    for row_no in range(row_count):
+        bottom = min_local_y + row_no * cell_height
+        top = min_local_y + (row_no + 1) * cell_height
+
+        for column_no in range(column_count):
+            left = min_local_x + column_no * cell_width
+            right = min_local_x + (column_no + 1) * cell_width
+            local_cell = box(left, bottom, right, top)
+            local_overlap = clean_geom(local_cell.intersection(local_piece))
+
+            if (
+                local_overlap is None
+                or local_overlap.is_empty
+                or local_overlap.area <= 1e-6
+            ):
+                continue
+
+            local_center = Point(
+                (left + right) / 2.0,
+                (bottom + top) / 2.0,
+            )
+
+            if local_piece.buffer(1e-8).covers(local_center):
+                local_point = local_center
+            else:
+                local_point = local_overlap.representative_point()
+
+            records.append({
+                "piece_no": piece_no,
+                "point": rotate(
+                    local_point,
+                    angle,
+                    origin=origin,
+                    use_radians=True,
+                ),
+                "cell": rotate(
+                    local_cell,
+                    angle,
+                    origin=origin,
+                    use_radians=True,
+                ),
+                "overlap_area_m2": float(local_overlap.area),
+                "cell_width_m": cell_width,
+                "cell_height_m": cell_height,
+            })
+
+    return records
+
+
+def cell_size_penalty(piece, resolution):
+    """10m에서 벗어난 셀 변 길이의 합"""
+    return sum(
+        abs(record["cell_width_m"] - resolution)
+        + abs(record["cell_height_m"] - resolution)
+        for record in make_piece_cell_records(piece, 1, resolution)
+    )
+
+
+def merge_piece_groups(first, second):
+    return {
+        "geometry": clean_geom(
+            unary_union([first["geometry"], second["geometry"]])
+        ),
+        "source_piece_nos": sorted(
+            first["source_piece_nos"] + second["source_piece_nos"]
+        ),
+    }
+
+
+def merge_undersized_piece_groups(pieces, resolution):
+    """좁은 자투리와 같은 방향으로 이어지는 조각을 MRR 단위로 병합"""
+    groups = [
+        {"geometry": piece, "source_piece_nos": [index]}
+        for index, piece in enumerate(pieces, start=1)
+    ]
+    adjacency_tolerance_m = 0.05
+    min_short_side_m = resolution * 0.75
+
+    while True:
+        undersized = [
+            (index, get_mrr_metrics(group["geometry"])[1])
+            for index, group in enumerate(groups)
+            if get_mrr_metrics(group["geometry"])[1] < min_short_side_m
+        ]
+
+        if not undersized:
+            break
+
+        source_index, _ = min(undersized, key=lambda item: item[1])
+        source = groups[source_index]
+        source_penalty = cell_size_penalty(source["geometry"], resolution)
+        candidates = []
+
+        for target_index, target in enumerate(groups):
+            if target_index == source_index:
+                continue
+
+            distance = source["geometry"].distance(target["geometry"])
+
+            if distance > adjacency_tolerance_m:
+                continue
+
+            merged = merge_piece_groups(source, target)
+            improvement = (
+                source_penalty
+                + cell_size_penalty(target["geometry"], resolution)
+                - cell_size_penalty(merged["geometry"], resolution)
+            )
+            candidates.append((improvement, -distance, target_index, merged))
+
+        if not candidates:
+            break
+
+        _, _, target_index, merged = max(
+            candidates,
+            key=lambda item: item[:2],
+        )
+
+        for index in sorted([source_index, target_index], reverse=True):
+            groups.pop(index)
+
+        groups.append(merged)
+
+    while True:
+        candidates = []
+
+        for first_index, first in enumerate(groups):
+            _, _, first_angle = get_mrr_metrics(first["geometry"])
+
+            for second_index in range(first_index + 1, len(groups)):
+                second = groups[second_index]
+
+                if (
+                    first["geometry"].distance(second["geometry"])
+                    > adjacency_tolerance_m
+                ):
+                    continue
+
+                _, _, second_angle = get_mrr_metrics(second["geometry"])
+
+                if angle_difference(first_angle, second_angle) > math.radians(10):
+                    continue
+
+                merged = merge_piece_groups(first, second)
+                merged_geom = merged["geometry"]
+
+                if get_rectangularity(merged_geom) < 0.8:
+                    continue
+
+                improvement = (
+                    cell_size_penalty(first["geometry"], resolution)
+                    + cell_size_penalty(second["geometry"], resolution)
+                    - cell_size_penalty(merged_geom, resolution)
+                )
+
+                if improvement <= 1e-6:
+                    continue
+
+                merged_long, merged_short, _ = get_mrr_metrics(merged_geom)
+                candidates.append((
+                    improvement,
+                    merged_long / max(merged_short, 1e-9),
+                    first_index,
+                    second_index,
+                    merged,
+                ))
+
+        if not candidates:
+            break
+
+        _, _, first_index, second_index, merged = max(
+            candidates,
+            key=lambda item: item[:2],
+        )
+
+        for index in sorted([first_index, second_index], reverse=True):
+            groups.pop(index)
+
+        groups.append(merged)
+
+    groups.sort(key=lambda group: min(group["source_piece_nos"]))
+    return groups
+
+
+def deduplicate_cell_records(records):
+    unique = []
+    seen = set()
+
+    for record in records:
+        point = record["point"]
+        key = (round(point.x, 8), round(point.y, 8))
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique.append(record)
+
+    return unique
+
+
+def resolve_overlapping_candidates(records, resolution, coverage_geom):
+    """다른 MRR의 근접·중첩 후보 중 지붕 유효면적이 작은 후보 제거"""
+    numbered_records = [
+        dict(record, candidate_no=index)
+        for index, record in enumerate(records, start=1)
+    ]
+    conflict_distance_m = resolution / 2.0
+
+    def conflicts(first, second):
+        if first["piece_no"] == second["piece_no"]:
+            return False
+
+        if first["point"].distance(second["point"]) >= conflict_distance_m:
+            return False
+
+        return first["cell"].intersection(second["cell"]).area > 1e-6
+
+    accepted = []
+    rejected = []
+
+    for record in sorted(
+        numbered_records,
+        key=lambda item: (-item["overlap_area_m2"], item["candidate_no"]),
+    ):
+        blockers = [other for other in accepted if conflicts(record, other)]
+
+        if blockers:
+            rejected.append(record)
+        else:
+            accepted.append(record)
+
+    while rejected:
+        covered = unary_union([
+            record["point"].buffer(resolution)
+            for record in accepted
+        ])
+        uncovered = clean_geom(coverage_geom.difference(covered))
+
+        if uncovered is None or uncovered.is_empty or uncovered.area <= 1e-6:
+            break
+
+        coverage_gains = [
+            (
+                uncovered.intersection(
+                    record["point"].buffer(resolution)
+                ).area,
+                index,
+            )
+            for index, record in enumerate(rejected)
+        ]
+        gain, restore_index = max(coverage_gains)
+
+        if gain <= 1e-6:
+            break
+
+        accepted.append(rejected.pop(restore_index))
+
+    accepted.sort(key=lambda item: item["candidate_no"])
+    return accepted
+
+
+def get_centered_axis_values(
+    min_value,
+    max_value,
+    resolution,
+    center_value=None,
+):
+    """기준 중심에 맞추고 범위 안에 유지되는 등간격 좌표 생성"""
+    span = max_value - min_value
+
+    if span <= 0:
+        return np.array([(min_value + max_value) / 2.0])
+
+    if center_value is None:
+        center_value = (min_value + max_value) / 2.0
+
+    center_value = min(max(center_value, min_value), max_value)
+
+    # 기존 중심 +/- n * 해상도 방식은 항상 홀수 개만 만들기 때문에
+    # 해상도 이상 2배 미만인 범위에도 점을 하나만 배치했다.
+    # 범위에 들어가는 최대 점 개수를 먼저 구해 짝수 개 배치도 허용한다.
+    point_count = math.floor((span + 1e-9) / resolution) + 1
+    used_span = (point_count - 1) * resolution
+    start = center_value - used_span / 2.0
+
+    # MRR 중심이 안전영역 경계 상자의 중앙과 다르더라도 모든 점을 범위 안에 둔다.
+    start = max(min_value, min(start, max_value - used_span))
+
+    return start + np.arange(point_count) * resolution
+
+
+def make_oriented_grid_candidates(poly, resolution, orientation_poly=None):
+    """기준 폴리곤의 MRR 방향에 맞춘 격자 후보점 생성"""
     if poly is None or poly.is_empty:
         return []
 
     if resolution <= 0:
         raise ValueError("지붕 격자 해상도는 0보다 커야 합니다.")
 
-    # 원본 건물을 감싸는 최소 면적 회전 사각형을 만든다.
-    rectangle = poly.minimum_rotated_rectangle
-    edges = get_rectangle_edges(poly)
+    if orientation_poly is None or orientation_poly.is_empty:
+        orientation_poly = poly
+
+    # 축소 전 분할 조각의 최소 면적 회전 사각형으로 격자 방향을 고정한다.
+    rectangle = orientation_poly.minimum_rotated_rectangle
+    edges = get_rectangle_edges(orientation_poly)
     start, end = max(edges, key=lambda edge: LineString(edge).length)
     angle = math.atan2(end[1] - start[1], end[0] - start[0])
 
     # 회전 사각형의 긴 변이 좌표축과 나란해지도록 회전한다.
     origin = (rectangle.centroid.x, rectangle.centroid.y)
-    local_rectangle = rotate(
-        rectangle,
+    local_poly = rotate(
+        poly,
         -angle,
         origin=origin,
         use_radians=True
     )
-    min_x, min_y, max_x, max_y = local_rectangle.bounds
+    min_x, min_y, max_x, max_y = local_poly.bounds
     width = max_x - min_x
     height = max_y - min_y
 
     if width <= 0 or height <= 0:
         return [get_geometric_center(poly)]
 
-    # 사각형 중심을 기준으로 정확히 10m 간격의 격자 후보를 만든다.
-    x_values = get_centered_axis_values(min_x, max_x, resolution)
-    y_values = get_centered_axis_values(min_y, max_y, resolution)
+    # 분할 조각의 MRR 중심축에 맞춰 정확한 해상도 간격의 후보를 만든다.
+    # 폭이 해상도보다 좁으면 MRR 장축을 따르는 1차원 배치가 된다.
+    x_values = get_centered_axis_values(
+        min_x,
+        max_x,
+        resolution,
+        center_value=origin[0],
+    )
+    y_values = get_centered_axis_values(
+        min_y,
+        max_y,
+        resolution,
+        center_value=origin[1],
+    )
 
     candidates = []
 
@@ -394,98 +748,60 @@ def make_oriented_grid_candidates(poly, resolution):
 
 
 def make_roof_receiver_points(geom, original_geom=None):
-    """지붕 안전영역 내 수음점 생성"""
+    """단순화 건물의 분할 MRR 셀을 기준으로 지붕 수음점 생성"""
     if geom is None or geom.is_empty:
         return [], "empty", 0
 
-    if original_geom is None:
-        original_geom = geom
+    simplified_geom = clean_geom(geom)
 
-    containment_geom = clean_geom(geom.intersection(original_geom))
-
-    if containment_geom is None or containment_geom.is_empty:
+    if simplified_geom is None or simplified_geom.is_empty:
         return [], "empty", 0
 
-    pieces = decompose_geometry(geom)
+    split_pieces = decompose_geometry(simplified_geom)
+    piece_groups = merge_undersized_piece_groups(
+        split_pieces,
+        roof_resolution_m,
+    )
+    records = []
 
-    # 외벽 수음점과의 이격 확보를 위한 외측 버퍼 기준 내측 축소
-    roof_geom = clean_geom(
-        geom
-        .buffer(-roof_inset_m, join_style="mitre")
-        .intersection(original_geom)
+    for piece_no, group in enumerate(piece_groups, start=1):
+        records.extend(
+            make_piece_cell_records(
+                group["geometry"],
+                piece_no,
+                roof_resolution_m,
+            )
+        )
+
+    records = deduplicate_cell_records(records)
+    records = resolve_overlapping_candidates(
+        records,
+        roof_resolution_m,
+        simplified_geom,
     )
 
-    # 지붕 안전영역 소멸 시 버퍼·원본 교집합의 중심점 배치
-    if roof_geom is None or roof_geom.is_empty:
-        return [get_geometric_center(containment_geom)], "center", len(pieces)
+    if len(records) == 0:
+        return [get_geometric_center(simplified_geom)], "center", len(piece_groups)
 
-    points = []
-    seen_xy = set()
-
-    # 각 분할 조각마다 안전 영역과 격자를 따로 계산한다.
-    for poly in pieces:
-        safe_piece = clean_geom(poly.intersection(roof_geom))
-
-        if safe_piece is None or safe_piece.is_empty:
-            continue
-
-        safe_piece_with_tolerance = safe_piece.buffer(1e-8)
-        candidates = make_oriented_grid_candidates(
-            safe_piece,
-            roof_resolution_m
-        )
-        piece_points = []
-
-        # 현재 조각의 축소 안전영역 내부 후보점 선별
-        for point in candidates:
-            if not safe_piece_with_tolerance.covers(point):
-                continue
-
-            piece_points.append(point)
-
-        # 후보가 하나 이하인 조각의 기하학적 중심점 배치
-        if len(piece_points) <= 1:
-            piece_points = [get_geometric_center(safe_piece)]
-
-        for point in piece_points:
-            xy = (round(point.x, 8), round(point.y, 8))
-
-            if xy in seen_xy:
-                continue
-
-            seen_xy.add(xy)
-            points.append(point)
-
-    # 모든 조각의 안전 영역이 사라진 경우에만 건물 전체 중심점을 사용한다.
-    if len(points) == 0:
-        return [get_geometric_center(roof_geom)], "center", len(pieces)
-
-    # 최종 수음점이 하나일 때 버퍼·원본 교집합의 중심점 재배치
-    if len(points) == 1:
-        return [get_geometric_center(containment_geom)], "center", len(pieces)
-
+    points = [record["point"] for record in records]
     placement_type = "grid" if len(points) > 1 else "center"
-
-    return points, placement_type, len(pieces)
+    return points, placement_type, len(piece_groups)
 
 
 def load_buildings():
-    """입력 건물 데이터 로드 및 필터링"""
-    if input_buffer_layer_name:
-        buildings = gpd.read_file(
-            input_building_buffer_gpkg_path,
-            layer=input_buffer_layer_name
-        )
-    else:
-        buildings = gpd.read_file(input_building_buffer_gpkg_path)
+    """단순화 건물 데이터 로드 및 필터링"""
+    buildings = gpd.read_file(
+        input_building_metadata_gpkg_path,
+        layer=input_building_layer_name,
+    )
 
     if buildings.crs is None:
-        raise ValueError("건물 GPKG에 CRS가 없습니다.")
+        raise ValueError("단순화 건물 GPKG에 CRS가 없습니다.")
 
     if buildings.crs.is_geographic:
         raise ValueError("미터 단위의 투영 좌표계를 사용해야 합니다.")
 
-    required_cols = [id_col, top_col, area_col]
+    required_cols = [id_col, top_col]
     missing_cols = [
         col for col in required_cols
         if col not in buildings.columns
@@ -505,16 +821,9 @@ def load_buildings():
         buildings[top_col],
         errors="coerce"
     )
-    buildings[area_col] = pd.to_numeric(
-        buildings[area_col],
-        errors="coerce"
-    )
-
     buildings = buildings[
         buildings[id_col].notna()
         & buildings[top_col].notna()
-        & buildings[area_col].notna()
-        & (buildings[area_col] >= min_building_area_m2)
     ].copy()
 
     duplicate_building_id_mask = buildings[id_col].astype(str).duplicated(
@@ -526,120 +835,64 @@ def load_buildings():
             duplicate_building_id_mask,
             id_col,
         ].head(5).tolist()
-        raise ValueError(f"건물 버퍼에 중복 ID가 있습니다: {duplicate_ids}")
-
-    original_buildings = gpd.read_file(
-        input_original_building_gpkg_path,
-        layer=input_original_building_layer_name,
-        bbox=tuple(buildings.total_bounds),
-    )
-
-    if original_buildings.crs is None:
-        raise ValueError("원본 건물 GPKG의 CRS가 없습니다.")
-
-    if id_col not in original_buildings.columns:
-        raise ValueError(
-            f"원본 건물 레이어에 ID 필드가 없습니다: {id_col}"
-        )
-
-    if original_buildings.crs != buildings.crs:
-        original_buildings = original_buildings.to_crs(buildings.crs)
-
-    original_buildings = original_buildings[
-        original_buildings.geometry.notnull()
-    ].copy()
-    original_buildings["geometry"] = (
-        original_buildings.geometry.apply(clean_geom)
-    )
-    original_buildings = original_buildings[
-        original_buildings.geometry.notnull()
-    ].copy()
-    original_buildings = original_buildings[
-        ~original_buildings.geometry.is_empty
-    ].copy()
-    original_buildings["_building_id_key"] = (
-        original_buildings[id_col].astype(str)
-    )
-    duplicate_building_id_mask = original_buildings[
-        "_building_id_key"
-    ].duplicated(keep=False)
-
-    if duplicate_building_id_mask.any():
-        duplicate_ids = original_buildings.loc[
-            duplicate_building_id_mask,
-            id_col,
-        ].head(5).tolist()
-        raise ValueError(f"원본 건물 레이어에 중복 ID가 있습니다: {duplicate_ids}")
-
-    original_geometry_by_id = original_buildings.set_index(
-        "_building_id_key"
-    ).geometry
-
-    buildings["_building_id_key"] = buildings[id_col].astype(str)
-    buildings["original_geometry"] = buildings[
-        "_building_id_key"
-    ].map(original_geometry_by_id)
-
-    missing_original_count = int(
-        buildings["original_geometry"].isna().sum()
-    )
-
-    if missing_original_count > 0:
-        raise ValueError(
-            "원본 형상을 찾지 못한 버퍼 건물이 있습니다: "
-            f"{missing_original_count}개"
-        )
-
-    buildings = buildings.drop(columns="_building_id_key")
+        raise ValueError(f"단순화 건물에 중복 ID가 있습니다: {duplicate_ids}")
 
     buildings = buildings.reset_index(drop=True)
 
     return buildings
 
 
+def make_roof_receiver_records(building_data, transformer):
+    """단일 건물의 지붕 수음점과 통계 반환"""
+    building_id, roof_top, geom = building_data
+    records = []
+    original_part_count = len(polygon_parts(geom))
+    points, placement_type, piece_count = make_roof_receiver_points(geom)
+    center_count = int(placement_type == "center")
+    grid_count = int(placement_type == "grid")
+    split_count = int(piece_count > original_part_count)
+    roof_alt = float(roof_top) + roof_height_offset_m
+
+    for point in points:
+        x, y = point.x, point.y
+        if not (min_x <= x <= max_x and min_y <= y <= max_y):
+            continue
+
+        lon, lat = transformer.transform(x, y)
+        records.append({
+            "building_id": building_id,
+            "x_epsg5179": x,
+            "y_epsg5179": y,
+            "lat": lat,
+            "lon": lon,
+            "alt": roof_alt,
+        })
+
+    return records, center_count, grid_count, split_count, piece_count
+
+
 def generate_receivers(buildings, transformer):
     """전체 지붕 수음점 생성 및 CSV 저장"""
-    records = []
-    center_building_count = 0
-    grid_building_count = 0
-    split_building_count = 0
-    total_piece_count = 0
-
-    for _, row in buildings.iterrows():
-        original_part_count = len(polygon_parts(row.geometry))
-        points, placement_type, piece_count = make_roof_receiver_points(
-            row.geometry,
-            row["original_geometry"]
-        )
-        total_piece_count += piece_count
-
-        if piece_count > original_part_count:
-            split_building_count += 1
-
-        if placement_type == "center":
-            center_building_count += 1
-        elif placement_type == "grid":
-            grid_building_count += 1
-
-        building_id = row[id_col]
-        roof_alt = float(row[top_col]) + roof_height_offset_m
-
-        for point in points:
-            x, y = point.x, point.y
-
-            if not (min_x <= x <= max_x and min_y <= y <= max_y):
-                continue
-
-            lon, lat = transformer.transform(x, y)
-
-            records.append({
-                "building_id": building_id,
-                "x_epsg5179": x,
-                "y_epsg5179": y,
-                "lat": lat,
-                "lon": lon,
-                "alt": roof_alt,
-            })
+    print("parallel workers:", parallel_workers)
+    print("maximum building chunk size:", building_chunk_size)
+    building_values = buildings[
+        [id_col, top_col, "geometry"]
+    ].itertuples(index=False, name=None)
+    building_results = parallel_map_ordered(
+        lambda value: make_roof_receiver_records(value, transformer),
+        building_values,
+        parallel_workers,
+        building_chunk_size,
+    )
+    records = [
+        record
+        for building_records, _, _, _, _ in building_results
+        for record in building_records
+    ]
+    center_building_count = sum(result[1] for result in building_results)
+    grid_building_count = sum(result[2] for result in building_results)
+    split_building_count = sum(result[3] for result in building_results)
+    total_piece_count = sum(result[4] for result in building_results)
 
     if len(records) == 0:
         raise ValueError("생성된 지붕 수음점이 없습니다.")
@@ -674,9 +927,10 @@ def generate_receivers(buildings, transformer):
 def main():
     validate_bounds(min_x, max_x, min_y, max_y)
     validate_positive(roof_resolution_m, "지붕 수음점 해상도")
+    validate_positive(parallel_workers, "공통 병렬 작업 수")
+    validate_positive(building_chunk_size, "건물 묶음 크기")
     validate_input_paths([
-        input_building_buffer_gpkg_path,
-        input_original_building_gpkg_path,
+        input_building_metadata_gpkg_path,
     ])
     output_csv_path.parent.mkdir(parents=True, exist_ok=True)
 

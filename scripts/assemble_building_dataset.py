@@ -9,17 +9,23 @@ from shapely.validation import make_valid
 try:
     from scripts.pipeline_common import (
         get_env_float,
+        get_env_int,
         get_env_path,
+        parallel_map_ordered,
         validate_bounds,
         validate_input_paths,
+        validate_positive,
         validate_spatial_file_coverage,
     )
 except ModuleNotFoundError:
     from pipeline_common import (
         get_env_float,
+        get_env_int,
         get_env_path,
+        parallel_map_ordered,
         validate_bounds,
         validate_input_paths,
+        validate_positive,
         validate_spatial_file_coverage,
     )
 
@@ -53,6 +59,9 @@ max_y = get_env_float("RECEIVER_MAX_Y", 1733000)
 closing_distance_m = 10.0
 simplify_tolerance_m = 1.0
 mrr_padding_m = 0.001
+min_area_m2 = 25.0
+parallel_workers = get_env_int("PARALLEL_WORKERS", 8)
+building_chunk_size = get_env_int("BUILDING_CHUNK_SIZE", 250)
 
 # =========================================================
 # 유틸 함수
@@ -179,6 +188,8 @@ def make_minimum_rotated_rectangle(geom):
 
 def main():
     validate_bounds(min_x, max_x, min_y, max_y)
+    validate_positive(parallel_workers, "공통 병렬 작업 수")
+    validate_positive(building_chunk_size, "건물 묶음 크기")
     validate_input_paths([
         input_building_height_gpkg_path,
     ])
@@ -218,7 +229,6 @@ def main():
         "BFLR_CO",
         "BLDH_MN",
         "BLDH_BV",
-        "BLDFH_MX",
         "Shape_Area",
         "geometry",
     ]
@@ -234,6 +244,25 @@ def main():
         raise ValueError("건물 단순화에는 미터 단위 투영 좌표계가 필요함")
 
     bld = bld[bld_keep].copy()
+
+    # 건물 수음점과 지면 IDW 입력의 건물 구성을 일치시킨다.
+    bld["Shape_Area"] = pd.to_numeric(bld["Shape_Area"], errors="coerce")
+    input_row_count = len(bld)
+    bld = bld[
+        bld["Shape_Area"].notna()
+        & (bld["Shape_Area"] >= min_area_m2)
+    ].copy()
+
+    print("[2] 건물 면적 사전 필터")
+    print(" - area column: Shape_Area")
+    print(" - minimum area [m2]:", min_area_m2)
+    print(" - removed rows:", input_row_count - len(bld))
+    print(" - remaining rows:", len(bld))
+
+    if bld.empty:
+        raise ValueError(
+            f"계산 영역에 면적 {min_area_m2} m2 이상인 건물이 없음"
+        )
 
     bld["NF_ID"] = bld["NF_ID"].apply(clean_str)
 
@@ -251,7 +280,14 @@ def main():
         duplicate_ids = bld.loc[duplicate_id_mask, "NF_ID"].head(5).tolist()
         raise ValueError(f"중복 NF_ID가 있음: {duplicate_ids}")
 
-    bld["geometry"] = bld.geometry.apply(to_multipolygon)
+    print(" - parallel workers:", parallel_workers)
+    print(" - maximum chunk size:", building_chunk_size)
+    bld["geometry"] = parallel_map_ordered(
+        to_multipolygon,
+        bld.geometry,
+        parallel_workers,
+        building_chunk_size,
+    )
     invalid_geometry_mask = (
         bld.geometry.isna()
         | bld.geometry.is_empty
@@ -265,7 +301,7 @@ def main():
     # =========================================================
     # 최종 필드 정리
     # =========================================================
-    print("[2] 최종 필드 정리")
+    print("[3] 최종 필드 정리")
 
     final_cols = [
         "NF_ID",
@@ -273,7 +309,6 @@ def main():
         "BFLR_CO",
         "BLDH_MN",
         "BLDH_BV",
-        "BLDFH_MX",
         "Shape_Area",
         "geometry",
     ]
@@ -287,8 +322,11 @@ def main():
 
     # 공통 단순화 형상과 전파 계산 속성 생성
     simplified_gdf = meta_final.copy()
-    simplified_gdf["geometry"] = simplified_gdf.geometry.apply(
-        simplify_building_polygon
+    simplified_gdf["geometry"] = parallel_map_ordered(
+        simplify_building_polygon,
+        simplified_gdf.geometry,
+        parallel_workers,
+        building_chunk_size,
     )
     simplified_invalid_mask = (
         simplified_gdf.geometry.isna()
@@ -305,8 +343,11 @@ def main():
 
     # 최소면적 회전사각형 생성
     mrr_gdf = simplified_gdf[["NF_ID", "geometry"]].copy()
-    mrr_gdf["geometry"] = mrr_gdf.geometry.apply(
-        make_minimum_rotated_rectangle
+    mrr_gdf["geometry"] = parallel_map_ordered(
+        make_minimum_rotated_rectangle,
+        mrr_gdf.geometry,
+        parallel_workers,
+        building_chunk_size,
     )
     mrr_invalid_mask = (
         mrr_gdf.geometry.isna()
@@ -344,7 +385,7 @@ def main():
     # =========================================================
     # 저장
     # =========================================================
-    print("[3] 저장")
+    print("[4] 저장")
 
     temporary_output_gpkg_path = output_gpkg_path.with_name(
         f"{output_gpkg_path.stem}.tmp{output_gpkg_path.suffix}"

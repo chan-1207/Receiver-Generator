@@ -4,13 +4,16 @@ import geopandas as gpd
 import pandas as pd
 import numpy as np
 from shapely.geometry import LineString, Point
+from shapely.strtree import STRtree
 from shapely.validation import make_valid
 from pyproj import Transformer
 
 try:
     from scripts.pipeline_common import (
         get_env_float,
+        get_env_int,
         get_env_path,
+        parallel_map_ordered,
         validate_bounds,
         validate_input_paths,
         validate_positive,
@@ -18,7 +21,9 @@ try:
 except ModuleNotFoundError:
     from pipeline_common import (
         get_env_float,
+        get_env_int,
         get_env_path,
+        parallel_map_ordered,
         validate_bounds,
         validate_input_paths,
         validate_positive,
@@ -55,6 +60,8 @@ min_y = get_env_float("RECEIVER_MIN_Y", 1732000)
 max_y = get_env_float("RECEIVER_MAX_Y", 1733000)
 
 z_tolerance_m = 0.05
+parallel_workers = get_env_int("PARALLEL_WORKERS", 8)
+building_chunk_size = get_env_int("BUILDING_CHUNK_SIZE", 250)
 
 # =========================
 # 보조 함수
@@ -183,51 +190,82 @@ def make_vertical_heights(building_h):
     )
 
 
-def is_blocked_by_other_building(receiver_row, conflict_gdf, sindex):
-    """
-    삭제 조건:
-    1. 수음점 XY가 다른 건물의 버퍼 폴리곤 안/경계에 있음
-    2. 수음점 alt가 상대 건물 top_alt 이하
+def find_blocked_receivers(receivers, conflict_gdf):
+    """공간 인덱스 일괄 조회로 다른 건물에 막힌 수음점을 반환한다."""
+    receiver_geometries = receivers.geometry.to_numpy()
+    conflict_geometries = conflict_gdf.geometry.to_numpy()
+    conflict_tree = STRtree(conflict_geometries)
+    candidate_pairs = conflict_tree.query(
+        receiver_geometries,
+        predicate="intersects",
+    )
 
-    높은 건물의 상부 수음점은 유지
-    """
-    p = receiver_row.geometry
-    my_id = receiver_row["building_id"]
-    alt = receiver_row["alt"]
+    blocked = np.zeros(len(receivers), dtype=bool)
+    if candidate_pairs.shape[1] == 0:
+        return blocked
 
-    candidate_idx = list(sindex.query(p, predicate="intersects"))
+    receiver_pair_ids = candidate_pairs[0]
+    conflict_pair_ids = candidate_pairs[1]
+    receiver_building_ids = receivers["building_id"].to_numpy()
+    receiver_altitudes = receivers["alt"].to_numpy(dtype=float)
+    conflict_building_ids = conflict_gdf[id_col].to_numpy()
+    conflict_top_altitudes = conflict_gdf[top_col].to_numpy(dtype=float)
 
-    if len(candidate_idx) == 0:
-        return False
+    other_building = (
+        receiver_building_ids[receiver_pair_ids]
+        != conflict_building_ids[conflict_pair_ids]
+    )
+    below_other_roof = (
+        receiver_altitudes[receiver_pair_ids]
+        <= conflict_top_altitudes[conflict_pair_ids] + z_tolerance_m
+    )
+    blocked_pairs = other_building & below_other_roof
+    blocked[receiver_pair_ids[blocked_pairs]] = True
+    return blocked
 
-    candidates = conflict_gdf.iloc[candidate_idx]
 
-    for _, other in candidates.iterrows():
-        other_id = other[id_col]
+def make_wall_receiver_records(building_data, transformer):
+    """단일 건물의 벽면 수음점 후보 반환"""
+    building_id, base, building_h, geom = building_data
+    records = []
+    outside_xy_count = 0
 
-        # 자기 건물 제외
-        if other_id == my_id:
+    if geom is None or geom.is_empty:
+        return records, outside_xy_count
+
+    heights = make_vertical_heights(float(building_h))
+    if len(heights) == 0:
+        return records, outside_xy_count
+
+    wall_points = get_exterior_receiver_points(geom, wall_resolution_m)
+    for point, edge_no in wall_points:
+        x, y = point.x, point.y
+        if not (min_x <= x <= max_x and min_y <= y <= max_y):
+            outside_xy_count += 1
             continue
 
-        other_top = other[top_col]
+        lon, lat = transformer.transform(x, y)
+        for height in heights:
+            records.append({
+                "building_id": building_id,
+                "edge_no": edge_no,
+                "x_epsg5179": x,
+                "y_epsg5179": y,
+                "lat": lat,
+                "lon": lon,
+                "alt": float(base) + float(height),
+                "geometry": Point(x, y),
+            })
 
-        if pd.isna(other_top):
-            continue
-
-        if not other.geometry.intersects(p):
-            continue
-
-        # 상대 건물 지붕 이하이면 막힌 수음점으로 판단
-        if alt <= float(other_top) + z_tolerance_m:
-            return True
-
-    return False
+    return records, outside_xy_count
 
 
 def main():
     validate_bounds(min_x, max_x, min_y, max_y)
     validate_positive(wall_resolution_m, "벽면 수음점 수평 해상도")
     validate_positive(vertical_resolution_m, "벽면 수음점 수직 해상도")
+    validate_positive(parallel_workers, "공통 병렬 작업 수")
+    validate_positive(building_chunk_size, "건물 묶음 크기")
     validate_input_paths([input_polygon_gpkg_path])
     output_csv_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -287,55 +325,26 @@ def main():
     # =========================
     # 수음점 후보 생성
     # =========================
-    records = []
-    receiver_count = 0
-    outside_xy_count = 0
-
-    for idx, row in buf.iterrows():
-        geom = row.geometry
-
-        if geom is None or geom.is_empty:
-            continue
-
-        building_id = row[id_col]
-
-        base = float(row[base_col])
-        top = float(row[top_col])
-        building_h = float(row["building_height"])
-
-        heights = make_vertical_heights(building_h)
-
-        if len(heights) == 0:
-            continue
-
-        # 이미 만들어둔 버퍼 폴리곤 외곽선 기준
-        wall_points = get_exterior_receiver_points(geom, wall_resolution_m)
-
-        for pt, edge_no in wall_points:
-            x, y = pt.x, pt.y
-
-            # 대상지역 외부 XY 후보 제외
-            if not (min_x <= x <= max_x and min_y <= y <= max_y):
-                outside_xy_count += 1
-                continue
-
-            lon, lat = transformer.transform(x, y)
-
-            for h in heights:
-                alt = base + float(h)
-
-                receiver_count += 1
-
-                records.append({
-                    "building_id": building_id,
-                    "edge_no": edge_no,
-                    "x_epsg5179": x,
-                    "y_epsg5179": y,
-                    "lat": lat,
-                    "lon": lon,
-                    "alt": alt,
-                    "geometry": Point(x, y)
-                })
+    print("parallel workers:", parallel_workers)
+    print("maximum building chunk size:", building_chunk_size)
+    building_values = buf[
+        [id_col, base_col, "building_height", "geometry"]
+    ].itertuples(index=False, name=None)
+    building_results = parallel_map_ordered(
+        lambda value: make_wall_receiver_records(value, transformer),
+        building_values,
+        parallel_workers,
+        building_chunk_size,
+    )
+    records = [
+        record
+        for building_records, _ in building_results
+        for record in building_records
+    ]
+    outside_xy_count = sum(
+        outside_count
+        for _, outside_count in building_results
+    )
 
     receivers = gpd.GeoDataFrame(records, geometry="geometry", crs=buf.crs)
 
@@ -352,11 +361,9 @@ def main():
     conflict_gdf = buf[[id_col, top_col, "geometry"]].copy()
     conflict_gdf = gpd.GeoDataFrame(conflict_gdf, geometry="geometry", crs=buf.crs)
 
-    sindex = conflict_gdf.sindex
-
-    receivers["is_blocked"] = receivers.apply(
-        lambda r: is_blocked_by_other_building(r, conflict_gdf, sindex),
-        axis=1
+    receivers["is_blocked"] = find_blocked_receivers(
+        receivers,
+        conflict_gdf,
     )
 
     filtered = receivers[~receivers["is_blocked"]].copy()
