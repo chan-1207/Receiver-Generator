@@ -1,7 +1,12 @@
 import json
 import math
 import os
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    wait,
+)
 from pathlib import Path
 
 import pyogrio
@@ -37,7 +42,8 @@ DEFAULT_TERRAIN_IDW_SETTINGS = {
     "contour_simplify_tolerance_m": 2.0,
 }
 DEFAULT_PARALLEL_PROCESSING_SETTINGS = {
-    "workers": 8,
+    "process_workers": 8,
+    "thread_workers": 8,
     "building_chunk_size": 250,
     "ground_factor_chunk_size": 20_000,
     "terrain_chunk_size": 2_000,
@@ -80,6 +86,40 @@ def get_env_bool(name, default):
     if normalized_value in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"환경변수 {name}의 값이 불리언이 아닙니다.")
+
+
+def prepare_temporary_output(output_path):
+    """최종 파일과 같은 폴더의 비어 있는 임시 출력 경로를 준비한다."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_name(
+        f"{output_path.stem}.tmp{output_path.suffix}"
+    )
+    if temporary_path.exists():
+        temporary_path.unlink()
+    return temporary_path
+
+
+def replace_temporary_output(temporary_path, output_path):
+    """완성된 임시 파일을 최종 파일로 교체한다."""
+    temporary_path = Path(temporary_path)
+    output_path = Path(output_path)
+    try:
+        temporary_path.replace(output_path)
+    except PermissionError as error:
+        raise PermissionError(
+            "최종 출력 파일을 교체하지 못했습니다. QGIS, Excel 등에서 "
+            "파일을 닫은 뒤 다시 실행하세요.\n"
+            f" - 기존 파일(보존됨): {output_path}\n"
+            f" - 새 임시 파일(보존됨): {temporary_path}"
+        ) from error
+
+
+def write_csv_atomically(dataframe, output_path, **to_csv_kwargs):
+    """CSV를 임시 파일에 완전히 기록한 뒤 최종 파일로 교체한다."""
+    temporary_path = prepare_temporary_output(output_path)
+    dataframe.to_csv(temporary_path, **to_csv_kwargs)
+    replace_temporary_output(temporary_path, output_path)
 
 
 def resolve_input_path(path_value, project_dir):
@@ -164,10 +204,15 @@ def load_parallel_processing_settings(raw_settings):
             "설정 파일의 parallel_processing 항목은 객체여야 합니다."
         )
 
+    legacy_workers = raw_parallel.get("workers", 8)
     parallel_settings = {
-        "workers": raw_parallel.get(
-            "workers",
-            DEFAULT_PARALLEL_PROCESSING_SETTINGS["workers"],
+        "process_workers": raw_parallel.get(
+            "process_workers",
+            legacy_workers,
+        ),
+        "thread_workers": raw_parallel.get(
+            "thread_workers",
+            legacy_workers,
         ),
         "building_chunk_size": raw_parallel.get(
             "building_chunk_size",
@@ -201,7 +246,8 @@ def load_parallel_processing_settings(raw_settings):
         ) from error
 
     for name, label in (
-        ("workers", "공통 병렬 작업 수"),
+        ("process_workers", "프로세스 작업 수"),
+        ("thread_workers", "스레드 작업 수"),
         ("building_chunk_size", "건물 묶음 크기"),
         ("ground_factor_chunk_size", "지면계수 묶음 크기"),
         ("terrain_chunk_size", "IDW 보간 묶음 크기"),
@@ -212,7 +258,7 @@ def load_parallel_processing_settings(raw_settings):
 
 
 def parallel_map_ordered(function, values, workers, chunk_size):
-    """입력 순서를 보존하는 제한형 병렬 매핑"""
+    """입력 순서를 보존하는 제한형 스레드 병렬 매핑"""
     value_list = list(values)
     if len(value_list) == 0:
         return []
@@ -262,6 +308,66 @@ def parallel_map_ordered(function, values, workers, chunk_size):
                     pending[
                         executor.submit(calculate, next_chunk_range)
                     ] = next_chunk_range
+
+    return result
+
+
+def _calculate_process_chunk(function, start, chunk_values):
+    """ProcessPool에서 실행할 직렬화 가능한 최상위 작업 함수."""
+    return start, [function(value) for value in chunk_values]
+
+
+def process_map_ordered(function, values, workers, chunk_size):
+    """독립적인 CPU 작업을 프로세스 묶음으로 실행하며 입력 순서를 보존한다."""
+    value_list = list(values)
+    if len(value_list) == 0:
+        return []
+
+    effective_chunk_size = min(
+        chunk_size,
+        max(1, math.ceil(len(value_list) / workers)),
+    )
+    chunk_ranges = [
+        (start, min(start + effective_chunk_size, len(value_list)))
+        for start in range(0, len(value_list), effective_chunk_size)
+    ]
+
+    if workers == 1 or len(chunk_ranges) == 1:
+        return [function(value) for value in value_list]
+
+    result = [None] * len(value_list)
+    chunk_iterator = iter(chunk_ranges)
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        pending = {}
+
+        def submit(chunk_range):
+            start, end = chunk_range
+            future = executor.submit(
+                _calculate_process_chunk,
+                function,
+                start,
+                value_list[start:end],
+            )
+            pending[future] = chunk_range
+
+        for _ in range(min(workers, len(chunk_ranges))):
+            submit(next(chunk_iterator))
+
+        while pending:
+            completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                pending.pop(future)
+                try:
+                    start, chunk_result = future.result()
+                except Exception:
+                    for pending_future in pending:
+                        pending_future.cancel()
+                    raise
+
+                result[start:start + len(chunk_result)] = chunk_result
+                next_chunk_range = next(chunk_iterator, None)
+                if next_chunk_range is not None:
+                    submit(next_chunk_range)
 
     return result
 
@@ -436,13 +542,6 @@ def validate_pipeline_spatial_coverage(settings):
         settings["max_x"],
         settings["max_y"],
     )
-    terrain_padding_m = settings["terrain_idw"]["max_search_radius_m"]
-    terrain_bounds = (
-        settings["min_x"] - terrain_padding_m,
-        settings["min_y"] - terrain_padding_m,
-        settings["max_x"] + terrain_padding_m,
-        settings["max_y"] + terrain_padding_m,
-    )
     input_files = settings["input_files"]
     specifications = [
         (
@@ -456,12 +555,6 @@ def validate_pipeline_spatial_coverage(settings):
             "토지피복도",
             area_bounds,
             "land_cover_map",
-        ),
-        (
-            input_files["terrain_contour_shp"],
-            "등고선",
-            terrain_bounds,
-            None,
         ),
     ]
 
@@ -481,6 +574,10 @@ def validate_pipeline_spatial_coverage(settings):
             "공간 입력 데이터가 계산 영역을 포함하지 않습니다.\n\n"
             + "\n\n".join(problems)
         )
+
+    # 등고선은 해안 밖 바다에는 존재하지 않는 선 데이터다. 사각형 전체에
+    # max_search_radius_m 여유를 더한 BBOX 커버리지를 강제하지 않고, 실제 육지
+    # 수음점별 IDW 최소 입력 조건으로 데이터 충분 여부를 검증한다.
 
 
 def load_pipeline_settings(config_path, project_dir):

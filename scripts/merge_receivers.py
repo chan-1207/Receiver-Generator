@@ -14,6 +14,7 @@ try:
         validate_bounds,
         validate_input_paths,
         validate_positive,
+        write_csv_atomically,
     )
 except ModuleNotFoundError:
     from pipeline_common import (
@@ -23,6 +24,7 @@ except ModuleNotFoundError:
         validate_bounds,
         validate_input_paths,
         validate_positive,
+        write_csv_atomically,
     )
 
 
@@ -452,7 +454,8 @@ def main():
 
     out_df = merged[output_cols].copy()
 
-    out_df.to_csv(
+    write_csv_atomically(
+        out_df,
         output_csv_path,
         index=False,
         encoding="utf-8-sig",

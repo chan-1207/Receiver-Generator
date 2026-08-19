@@ -1,19 +1,20 @@
 {
   "area": {
-    "min_x": 1137100,
-    "max_x": 1150500,
-    "min_y": 1726100,
-    "max_y": 1740900
+    "min_x": 1140450,
+    "max_x": 1177650,
+    "min_y": 1720300,
+    "max_y": 1737900
   },
   "grid": {
     "resolution_m": 10.0,
     "grid_size_m": 100.0
   },
   "parallel_processing": {
-    "workers": 24,
-    "building_chunk_size": 32,
-    "ground_factor_chunk_size": 1000,
-    "terrain_chunk_size": 1000
+    "process_workers": 20,
+    "thread_workers": 24,
+    "building_chunk_size": 250,
+    "ground_factor_chunk_size": 20000,
+    "terrain_chunk_size": 2000
   },
   "terrain_idw": {
     "search_radius_m": 800.0,
@@ -29,7 +30,7 @@
   },
   "input_files": {
     "building_height_gpkg": "data/building_height/building_height.gpkg",
-    "terrain_contour_shp": "data/terrain/terrain.shp",
+    "terrain_contour_shp": "data/terrain/ulsan.shp",
     "land_cover_gpkg": "data/land_cover_map/land_cover_map.gpkg",
     "ground_factor_mapping_csv": "config/land_cover_ground_factor.csv"
   }

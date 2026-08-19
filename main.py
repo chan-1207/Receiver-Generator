@@ -28,6 +28,7 @@ DEFAULT_OUTPUT_FILES = {
     "building_buffer": "receivers/building/building_buffers_10m.gpkg",
     "wall_receiver": "receivers/building/building_receivers.csv",
     "roof_receiver": "receivers/building/building_roof_receivers.csv",
+    "coastline": "data/coastline/ulsan_coastline.gpkg",
     "terrain_receiver": "receivers/terrain/terrain_receivers_center.csv",
     "merged_receiver": "receivers/merged_receivers.csv",
 }
@@ -42,6 +43,7 @@ pipeline = [
     ("건물 벽면 버퍼 생성", "scripts/generate_building_wall_buffers.py", True),
     ("건물 벽면 수음점 생성", "scripts/generate_building_wall_receivers.py", True),
     ("건물 지붕 수음점 생성", "scripts/generate_building_roof_receivers.py", True),
+    ("해안선 생성", "scripts/extract_coastline.py", False),
     ("지면 수음점 생성", "scripts/generate_terrain_receivers.py", False),
     ("수음점 병합", "scripts/merge_receivers.py", False),
 ]
@@ -104,7 +106,8 @@ def make_environment(settings, output_paths):
         "RECEIVER_MAX_Y": str(settings["max_y"]),
         "RECEIVER_RESOLUTION_M": str(settings["resolution_m"]),
         "GRID_SIZE_M": str(settings["grid_size_m"]),
-        "PARALLEL_WORKERS": str(parallel_processing["workers"]),
+        "PROCESS_WORKERS": str(parallel_processing["process_workers"]),
+        "THREAD_WORKERS": str(parallel_processing["thread_workers"]),
         "BUILDING_CHUNK_SIZE": str(
             parallel_processing["building_chunk_size"]
         ),
@@ -135,6 +138,7 @@ def make_environment(settings, output_paths):
         "GROUND_FACTOR_MAPPING_CSV": str(
             input_files["ground_factor_mapping_csv"]
         ),
+        "COASTLINE_INPUT_GPKG": str(output_paths["coastline"]),
         "BUILDING_METADATA_OUTPUT_GPKG": str(
             output_paths["building_metadata_gpkg"]
         ),
@@ -218,8 +222,17 @@ def run_pipeline(prefix=None, suffix=None):
 
         script_path = project_dir / relative_script_path
         print(f"\n[{step_no}/{len(pipeline)}] {step_name}", flush=True)
+        command = [sys.executable, str(script_path)]
+        if relative_script_path == "scripts/extract_coastline.py":
+            command.extend([
+                "--config",
+                str(config_path),
+                "--output",
+                str(output_paths["coastline"]),
+                "--overwrite",
+            ])
         subprocess.run(
-            [sys.executable, str(script_path)],
+            command,
             cwd=project_dir,
             env=env,
             check=True,

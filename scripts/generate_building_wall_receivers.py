@@ -1,8 +1,10 @@
 from pathlib import Path
+import math
 
 import geopandas as gpd
 import pandas as pd
 import numpy as np
+import shapely
 from shapely.geometry import LineString, Point
 from shapely.strtree import STRtree
 from shapely.validation import make_valid
@@ -14,9 +16,11 @@ try:
         get_env_int,
         get_env_path,
         parallel_map_ordered,
+        process_map_ordered,
         validate_bounds,
         validate_input_paths,
         validate_positive,
+        write_csv_atomically,
     )
 except ModuleNotFoundError:
     from pipeline_common import (
@@ -24,9 +28,11 @@ except ModuleNotFoundError:
         get_env_int,
         get_env_path,
         parallel_map_ordered,
+        process_map_ordered,
         validate_bounds,
         validate_input_paths,
         validate_positive,
+        write_csv_atomically,
     )
 
 # =========================
@@ -60,7 +66,8 @@ min_y = get_env_float("RECEIVER_MIN_Y", 1732000)
 max_y = get_env_float("RECEIVER_MAX_Y", 1733000)
 
 z_tolerance_m = 0.05
-parallel_workers = get_env_int("PARALLEL_WORKERS", 8)
+process_workers = get_env_int("PROCESS_WORKERS", 8)
+thread_workers = get_env_int("THREAD_WORKERS", 8)
 building_chunk_size = get_env_int("BUILDING_CHUNK_SIZE", 250)
 
 # =========================
@@ -191,40 +198,66 @@ def make_vertical_heights(building_h):
 
 
 def find_blocked_receivers(receivers, conflict_gdf):
-    """공간 인덱스 일괄 조회로 다른 건물에 막힌 수음점을 반환한다."""
-    receiver_geometries = receivers.geometry.to_numpy()
+    """공유 공간 인덱스를 스레드로 조회해 다른 건물 버퍼와 겹치는 점을 찾는다."""
+    receiver_geometries = shapely.points(
+        receivers["x_epsg5179"].to_numpy(dtype=float),
+        receivers["y_epsg5179"].to_numpy(dtype=float),
+    )
     conflict_geometries = conflict_gdf.geometry.to_numpy()
     conflict_tree = STRtree(conflict_geometries)
-    candidate_pairs = conflict_tree.query(
-        receiver_geometries,
-        predicate="intersects",
-    )
-
-    blocked = np.zeros(len(receivers), dtype=bool)
-    if candidate_pairs.shape[1] == 0:
-        return blocked
-
-    receiver_pair_ids = candidate_pairs[0]
-    conflict_pair_ids = candidate_pairs[1]
     receiver_building_ids = receivers["building_id"].to_numpy()
     receiver_altitudes = receivers["alt"].to_numpy(dtype=float)
     conflict_building_ids = conflict_gdf[id_col].to_numpy()
     conflict_top_altitudes = conflict_gdf[top_col].to_numpy(dtype=float)
+    point_count = len(receivers)
+    effective_chunk_size = max(
+        10_000,
+        min(
+            100_000,
+            math.ceil(point_count / max(1, thread_workers * 4)),
+        ),
+    )
+    chunk_ranges = [
+        (start, min(start + effective_chunk_size, point_count))
+        for start in range(0, point_count, effective_chunk_size)
+    ]
 
-    other_building = (
-        receiver_building_ids[receiver_pair_ids]
-        != conflict_building_ids[conflict_pair_ids]
-    )
-    below_other_roof = (
-        receiver_altitudes[receiver_pair_ids]
-        <= conflict_top_altitudes[conflict_pair_ids] + z_tolerance_m
-    )
-    blocked_pairs = other_building & below_other_roof
-    blocked[receiver_pair_ids[blocked_pairs]] = True
+    def calculate(chunk_range):
+        start, end = chunk_range
+        chunk_blocked = np.zeros(end - start, dtype=bool)
+        candidate_pairs = conflict_tree.query(
+            receiver_geometries[start:end],
+            predicate="intersects",
+        )
+        if candidate_pairs.shape[1] == 0:
+            return start, chunk_blocked
+
+        local_receiver_ids = candidate_pairs[0]
+        conflict_ids = candidate_pairs[1]
+        receiver_ids = receiver_building_ids[start:end][local_receiver_ids]
+        receiver_z = receiver_altitudes[start:end][local_receiver_ids]
+        other_building = receiver_ids != conflict_building_ids[conflict_ids]
+        below_other_roof = (
+            receiver_z
+            <= conflict_top_altitudes[conflict_ids] + z_tolerance_m
+        )
+        chunk_blocked[local_receiver_ids[other_building & below_other_roof]] = True
+        return start, chunk_blocked
+
+    print("overlap query thread workers:", thread_workers)
+    print("overlap query chunk size:", effective_chunk_size)
+    blocked = np.zeros(point_count, dtype=bool)
+    for start, chunk_blocked in parallel_map_ordered(
+        calculate,
+        chunk_ranges,
+        thread_workers,
+        1,
+    ):
+        blocked[start:start + len(chunk_blocked)] = chunk_blocked
     return blocked
 
 
-def make_wall_receiver_records(building_data, transformer):
+def make_wall_receiver_records(building_data):
     """단일 건물의 벽면 수음점 후보 반환"""
     building_id, base, building_h, geom = building_data
     records = []
@@ -244,18 +277,14 @@ def make_wall_receiver_records(building_data, transformer):
             outside_xy_count += 1
             continue
 
-        lon, lat = transformer.transform(x, y)
         for height in heights:
-            records.append({
-                "building_id": building_id,
-                "edge_no": edge_no,
-                "x_epsg5179": x,
-                "y_epsg5179": y,
-                "lat": lat,
-                "lon": lon,
-                "alt": float(base) + float(height),
-                "geometry": Point(x, y),
-            })
+            records.append((
+                building_id,
+                edge_no,
+                x,
+                y,
+                float(base) + float(height),
+            ))
 
     return records, outside_xy_count
 
@@ -264,7 +293,8 @@ def main():
     validate_bounds(min_x, max_x, min_y, max_y)
     validate_positive(wall_resolution_m, "벽면 수음점 수평 해상도")
     validate_positive(vertical_resolution_m, "벽면 수음점 수직 해상도")
-    validate_positive(parallel_workers, "공통 병렬 작업 수")
+    validate_positive(process_workers, "프로세스 작업 수")
+    validate_positive(thread_workers, "스레드 작업 수")
     validate_positive(building_chunk_size, "건물 묶음 크기")
     validate_input_paths([input_polygon_gpkg_path])
     output_csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -320,20 +350,18 @@ def main():
     # =========================
     # 좌표 변환기
     # =========================
-    transformer = Transformer.from_crs(buf.crs, "EPSG:4326", always_xy=True)
-
     # =========================
     # 수음점 후보 생성
     # =========================
-    print("parallel workers:", parallel_workers)
+    print("process workers:", process_workers)
     print("maximum building chunk size:", building_chunk_size)
     building_values = buf[
         [id_col, base_col, "building_height", "geometry"]
     ].itertuples(index=False, name=None)
-    building_results = parallel_map_ordered(
-        lambda value: make_wall_receiver_records(value, transformer),
+    building_results = process_map_ordered(
+        make_wall_receiver_records,
         building_values,
-        parallel_workers,
+        process_workers,
         building_chunk_size,
     )
     records = [
@@ -346,7 +374,16 @@ def main():
         for _, outside_count in building_results
     )
 
-    receivers = gpd.GeoDataFrame(records, geometry="geometry", crs=buf.crs)
+    receivers = pd.DataFrame(
+        records,
+        columns=[
+            "building_id",
+            "edge_no",
+            "x_epsg5179",
+            "y_epsg5179",
+            "alt",
+        ],
+    )
 
     print("candidate receivers count:", len(receivers))
     print("outside XY candidate count:", outside_xy_count)
@@ -374,6 +411,14 @@ def main():
     # =========================
     # CSV 저장
     # =========================
+    transformer = Transformer.from_crs(buf.crs, "EPSG:4326", always_xy=True)
+    lon, lat = transformer.transform(
+        filtered["x_epsg5179"].to_numpy(dtype=float),
+        filtered["y_epsg5179"].to_numpy(dtype=float),
+    )
+    filtered["lat"] = lat
+    filtered["lon"] = lon
+
     output_cols = [
         "building_id",
         "edge_no",
@@ -385,7 +430,12 @@ def main():
     ]
 
     out_df = filtered[output_cols].copy()
-    out_df.to_csv(output_csv_path, index=False, encoding="utf-8-sig")
+    write_csv_atomically(
+        out_df,
+        output_csv_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
 
     print(f"saved: {output_csv_path}")
     print(f"receivers count: {len(out_df)}")

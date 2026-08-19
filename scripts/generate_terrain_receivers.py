@@ -23,6 +23,7 @@ try:
         validate_input_paths,
         validate_positive,
         validate_spatial_file_coverage,
+        write_csv_atomically,
     )
 except ModuleNotFoundError:
     from pipeline_common import (
@@ -34,6 +35,7 @@ except ModuleNotFoundError:
         validate_input_paths,
         validate_positive,
         validate_spatial_file_coverage,
+        write_csv_atomically,
     )
 
 
@@ -50,6 +52,10 @@ input_land_cover_path = get_env_path(
     "LAND_COVER_INPUT_GPKG",
     project_dir / "data/land_cover_map/land_cover_map.gpkg",
 )
+input_coastline_path = get_env_path(
+    "COASTLINE_INPUT_GPKG",
+    project_dir / "data/coastline/ulsan_coastline.gpkg",
+)
 ground_factor_mapping_path = get_env_path(
     "GROUND_FACTOR_MAPPING_CSV",
     project_dir / "config/land_cover_ground_factor.csv",
@@ -65,6 +71,9 @@ input_building_metadata_gpkg_path = get_env_path(
 
 land_cover_layer_name = "land_cover_map"
 land_cover_code_field = "L2_CODE"
+marine_water_code = "720"
+coastline_layer_name = "coastline"
+coastline_elevation_field = "elevation"
 elevation_field = "CONT"
 receiver_crs = "EPSG:5179"
 coverage_tolerance = 1.0e-4
@@ -122,12 +131,6 @@ debug_grid_csv_path = project_dir / "receivers/terrain/debug_grid_10m.csv"
 # 격자 생성 함수
 # =========================
 def make_grid():
-    transformer = Transformer.from_crs(
-        "EPSG:5179",
-        "EPSG:4326",
-        always_xy=True
-    )
-
     x_cell_count = (max_x - min_x) / grid_m
     y_cell_count = (max_y - min_y) / grid_m
     if not np.isclose(x_cell_count, round(x_cell_count)):
@@ -143,14 +146,28 @@ def make_grid():
     grid_x, grid_y = np.meshgrid(xs, ys, indexing="xy")
     flat_x = grid_x.ravel(order="C")
     flat_y = grid_y.ravel(order="C")
-    lon, lat = transformer.transform(flat_x, flat_y)
 
     return pd.DataFrame({
         "x_epsg5179": flat_x,
         "y_epsg5179": flat_y,
-        "lat": lat,
-        "lon": lon,
     })
+
+
+def add_geographic_coordinates(grid_df):
+    """최종 육지 수음점에만 WGS84 위경도를 추가한다."""
+    transformer = Transformer.from_crs(
+        receiver_crs,
+        "EPSG:4326",
+        always_xy=True,
+    )
+    lon, lat = transformer.transform(
+        grid_df["x_epsg5179"].to_numpy(dtype=float),
+        grid_df["y_epsg5179"].to_numpy(dtype=float),
+    )
+    result = grid_df.copy()
+    result["lat"] = lat
+    result["lon"] = lon
+    return result
 
 
 # =========================
@@ -695,11 +712,25 @@ def assign_ground_factor(grid_df):
     result = grid_df.copy()
     result["ground_factor"] = np.clip(result_factors, 0.0, 1.0)
 
+    marine_geometries = land_cover.loc[
+        land_cover[land_cover_code_field] == marine_water_code,
+        "geometry",
+    ].to_numpy()
+    result["_is_marine_water"] = False
+    if len(marine_geometries) > 0:
+        marine_union = shapely.union_all(marine_geometries)
+        grid_points = shapely.points(grid_x, grid_y)
+        result["_is_marine_water"] = shapely.covers(
+            marine_union,
+            grid_points,
+        )
+
     print("[지면계수]")
     print(" - land cover:", input_land_cover_path)
     print(" - mapped cells:", len(result))
     print(" - direct cells:", direct_cell_count)
     print(" - exact intersection cells:", exact_cell_count)
+    print(" - marine water cells:", int(result["_is_marine_water"].sum()))
     print(" - min:", result["ground_factor"].min())
     print(" - max:", result["ground_factor"].max())
 
@@ -774,6 +805,71 @@ def read_contours(contour_path):
     print(" - elevation min:", elevations.min())
     print(" - elevation max:", elevations.max())
     return contours, elevations
+
+
+def read_coastline(coastline_path):
+    """고도 0m IDW 제약선으로 사용할 해안선을 읽는다."""
+    search_bounds = (
+        min_x - idw_max_search_radius_m,
+        min_y - idw_max_search_radius_m,
+        max_x + idw_max_search_radius_m,
+        max_y + idw_max_search_radius_m,
+    )
+    coastline_info = pyogrio.read_info(
+        coastline_path,
+        layer=coastline_layer_name,
+    )
+    coastline_crs_value = coastline_info.get("crs")
+    if coastline_crs_value is None:
+        raise ValueError(f"해안선 CRS가 없습니다: {coastline_path}")
+
+    coastline_crs = CRS.from_user_input(coastline_crs_value)
+    source_bounds = search_bounds
+    if coastline_crs.to_epsg() != 5179:
+        bounds_transformer = Transformer.from_crs(
+            receiver_crs,
+            coastline_crs,
+            always_xy=True,
+        )
+        source_bounds = bounds_transformer.transform_bounds(
+            *search_bounds,
+            densify_pts=21,
+        )
+
+    coastline = gpd.read_file(
+        coastline_path,
+        layer=coastline_layer_name,
+        bbox=source_bounds,
+    )
+    if coastline_elevation_field not in coastline.columns:
+        raise ValueError(
+            f"해안선 고도 필드가 없습니다: {coastline_elevation_field}"
+        )
+    if coastline.empty:
+        raise ValueError("대상 영역과 겹치는 해안선이 없습니다.")
+    if coastline.crs.to_epsg() != 5179:
+        coastline = coastline.to_crs(receiver_crs)
+
+    coastline[coastline_elevation_field] = pd.to_numeric(
+        coastline[coastline_elevation_field],
+        errors="coerce",
+    )
+    valid = (
+        coastline.geometry.notna()
+        & ~coastline.geometry.is_empty
+        & np.isfinite(coastline[coastline_elevation_field])
+    )
+    coastline = coastline.loc[valid]
+    if coastline.empty:
+        raise ValueError("IDW 입력으로 사용할 유효한 해안선이 없습니다.")
+
+    geometries = coastline.geometry.to_numpy()
+    elevations = coastline[coastline_elevation_field].to_numpy(dtype=float)
+    print("[IDW 해안선 입력]")
+    print(" - path:", coastline_path)
+    print(" - features:", len(geometries))
+    print(" - elevation min/max:", elevations.min(), elevations.max())
+    return geometries, elevations
 
 
 # =========================
@@ -1436,21 +1532,88 @@ def read_building_mask():
 
 
 def mask_grid_by_buildings(grid_df, building_union):
-    """건물 폴리곤 내부 또는 경계의 격자 중심점을 제거한다."""
+    """건물 폴리곤 내부 또는 경계의 격자 중심점을 병렬 제거한다."""
     if building_union is None:
         print("[IDW 건물 폴리곤 마스킹]")
         print(" - removed: 0")
         print(" - remaining:", len(grid_df))
         return grid_df.reset_index(drop=True)
 
-    points = shapely.points(
-        grid_df["x_epsg5179"].to_numpy(dtype=float),
-        grid_df["y_epsg5179"].to_numpy(dtype=float),
+    grid_x = grid_df["x_epsg5179"].to_numpy(dtype=float)
+    grid_y = grid_df["y_epsg5179"].to_numpy(dtype=float)
+    point_count = len(grid_df)
+    effective_chunk_size = max(
+        10_000,
+        min(
+            100_000,
+            math.ceil(point_count / max(1, parallel_workers * 4)),
+        ),
     )
-    inside_or_boundary = shapely.covers(building_union, points)
-    result = grid_df.loc[~inside_or_boundary].reset_index(drop=True)
+    chunk_ranges = [
+        (start, min(start + effective_chunk_size, point_count))
+        for start in range(0, point_count, effective_chunk_size)
+    ]
+    inside_or_boundary = np.zeros(point_count, dtype=bool)
+
+    # 반복되는 covers 연산에서 공간 인덱스를 재사용한다.
+    shapely.prepare(building_union)
+
+    def calculate(chunk_range):
+        start, end = chunk_range
+        points = shapely.points(grid_x[start:end], grid_y[start:end])
+        return start, end, shapely.covers(building_union, points)
+
     print("[IDW 건물 폴리곤 마스킹]")
-    print(" - before:", len(grid_df))
+    print(" - before:", point_count)
+    print(" - workers:", parallel_workers)
+    print(" - chunk size:", effective_chunk_size)
+    print(" - chunks:", len(chunk_ranges))
+
+    if parallel_workers == 1 or len(chunk_ranges) == 1:
+        for completed_count, chunk_range in enumerate(chunk_ranges, start=1):
+            start, end, chunk_mask = calculate(chunk_range)
+            inside_or_boundary[start:end] = chunk_mask
+            print(
+                f" - completed chunks {completed_count}/{len(chunk_ranges)}: "
+                f"{end:,}/{point_count:,}"
+            )
+    else:
+        completed_points = 0
+        chunk_iterator = iter(chunk_ranges)
+        with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+            pending = {}
+            for _ in range(min(parallel_workers, len(chunk_ranges))):
+                chunk_range = next(chunk_iterator)
+                pending[executor.submit(calculate, chunk_range)] = chunk_range
+
+            completed_count = 0
+            while pending:
+                completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    pending.pop(future)
+                    try:
+                        start, end, chunk_mask = future.result()
+                    except Exception:
+                        for pending_future in pending:
+                            pending_future.cancel()
+                        raise
+
+                    inside_or_boundary[start:end] = chunk_mask
+                    completed_count += 1
+                    completed_points += end - start
+                    print(
+                        f" - completed chunks {completed_count}/"
+                        f"{len(chunk_ranges)}: "
+                        f"{completed_points:,}/{point_count:,}"
+                    )
+
+                    next_chunk_range = next(chunk_iterator, None)
+                    if next_chunk_range is not None:
+                        pending[
+                            executor.submit(calculate, next_chunk_range)
+                        ] = next_chunk_range
+
+    result = grid_df.loc[~inside_or_boundary].reset_index(drop=True)
     print(
         " - removed inside or on boundary:",
         int(np.count_nonzero(inside_or_boundary)),
@@ -1467,16 +1630,27 @@ def make_terrain_receivers():
     ) = read_building_mask()
     grid_df = mask_grid_by_buildings(make_grid(), building_union)
     grid_df = assign_ground_factor(grid_df)
+    marine_mask = grid_df["_is_marine_water"].to_numpy(dtype=bool)
+    grid_df = grid_df.loc[~marine_mask].reset_index(drop=True)
+    if grid_df.empty:
+        raise ValueError("해양수 격자를 제외한 육지 수음점이 없습니다.")
+    print("[해양수 수음점 제외]")
+    print(" - removed:", int(marine_mask.sum()))
+    print(" - remaining land receivers:", len(grid_df))
+
     contours, elevations = read_contours(input_contour_path)
+    coastlines, coastline_elevations = read_coastline(input_coastline_path)
+    terrain_sources = np.concatenate([contours, coastlines])
+    terrain_elevations = np.concatenate([elevations, coastline_elevations])
     ground_z = calculate_contour_idw_ground_z(
-        contours,
-        elevations,
+        terrain_sources,
+        terrain_elevations,
         grid_df,
         building_geometries,
         building_elevations,
     )
 
-    receivers = grid_df.copy()
+    receivers = add_geographic_coordinates(grid_df)
     receivers["ground_alt"] = ground_z
     receivers["alt"] = receivers["ground_alt"] + receiver_height_m
 
@@ -1507,6 +1681,7 @@ def main():
     )
     required_input_paths = [
         input_contour_path,
+        input_coastline_path,
         input_land_cover_path,
         ground_factor_mapping_path,
     ]
@@ -1520,17 +1695,6 @@ def main():
         required_bounds=area_bounds,
         layer=land_cover_layer_name,
     )
-    contour_bounds = (
-        min_x - idw_max_search_radius_m,
-        min_y - idw_max_search_radius_m,
-        max_x + idw_max_search_radius_m,
-        max_y + idw_max_search_radius_m,
-    )
-    validate_spatial_file_coverage(
-        path=input_contour_path,
-        label="등고선",
-        required_bounds=contour_bounds,
-    )
     output_csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     # =========================
@@ -1543,7 +1707,8 @@ def main():
     print(" - output:", output_csv_path)
 
     if save_debug_grid:
-        receivers.to_csv(
+        write_csv_atomically(
+            receivers,
             debug_grid_csv_path,
             index=False,
             encoding="utf-8-sig"
@@ -1564,7 +1729,8 @@ def main():
 
     out_df = receivers[output_cols].copy()
 
-    out_df.to_csv(
+    write_csv_atomically(
+        out_df,
         output_csv_path,
         index=False,
         encoding="utf-8-sig",

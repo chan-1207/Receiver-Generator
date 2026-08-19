@@ -10,10 +10,11 @@
     "grid_size_m": 100.0
   },
   "parallel_processing": {
-    "workers": 24,
-    "building_chunk_size": 32,
-    "ground_factor_chunk_size": 1000,
-    "terrain_chunk_size": 1000
+    "process_workers": 20,
+    "thread_workers": 24,
+    "building_chunk_size": 250,
+    "ground_factor_chunk_size": 20000,
+    "terrain_chunk_size": 2000
   },
   "terrain_idw": {
     "search_radius_m": 800.0,

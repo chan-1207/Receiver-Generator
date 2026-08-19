@@ -128,6 +128,11 @@
 `max_search_radius_m`까지 탐색을 확대합니다. 수음점이 등고선과 직접 겹치면 해당
 등고선 표고를 사용합니다.
 
+`main.py`는 지면 수음점 생성 전에 토지피복 코드 `720`(해양수)과 비해양
+폴리곤의 공통 경계를 추출해 고도 0m 해안선을 생성합니다. 해양수 격자는 수음점에서
+제외하고, 생성한 해안선은 등고선과 함께 IDW 입력으로 사용해 해안가 고도가 내륙
+등고선만으로 과대 추정되는 현상을 줄입니다.
+
 IDW 입력에는 등고선뿐 아니라 `building_simplified` 건물 폴리곤도 포함합니다.
 각 건물 폴리곤까지의 최근접 거리와 해당 건물의 지반고 `BLDH_MN`을 사용하며,
 최소 `min_contours`개의 등고선을 우선 확보한 뒤 남은 후보를 등고선과 건물 중
@@ -136,17 +141,23 @@ IDW 입력에서 완전히 제외되지 않습니다. 동시에
 건물 폴리곤 내부 또는 경계에 놓인 지면 격자 중심점을 제거하고, 최종 병합 단계에서
 기존 1m 건물 버퍼 내부의 지면 수음점을 추가로 제거합니다. 보간 후 건물에 맞춰
 주변 지형고를 다시 자르는 사후 보정은 적용하지 않습니다.
+건물 마스킹은 전체 지면 격자를 제한된 크기의 묶음으로 나누어
+`parallel_processing.workers`만큼 병렬 처리하며, 위경도 변환은 건물과 해양수
+격자를 제거한 최종 육지 수음점에만 수행합니다.
 
 `input_files`의 경로는 프로젝트 루트 기준 상대경로 또는 절대경로로
 설정할 수 있습니다. `main.py`가 건물 메타데이터, 건물 버퍼, 벽면·지붕·지면
 수음점을 순서대로 새로 생성하므로 기존 중간 산출물은 필요하지 않습니다.
+모든 GPKG와 CSV 산출물은 최종 파일과 같은 폴더의 `.tmp` 파일에 먼저 완전히
+기록한 뒤 최종 경로로 교체합니다. 최종 파일이 QGIS나 Excel에 열려 있어 교체할 수
+없으면 기존 파일과 완성된 임시 파일을 모두 보존하고 경로를 오류 메시지에 표시합니다.
 
-파이프라인 시작 전 모든 공간 입력을 EPSG:5179로 변환해 범위를 검사합니다.
-건물과 토지피복도는 계산 영역 전체, 등고선은 계산 영역 외곽
-`max_search_radius_m`까지 포함해야 합니다. 범위가 부족하면 데이터 범위, 필요 범위,
-방향별 부족 거리를 출력하고 계산을 시작하지 않습니다. 토지피복도는 지면 격자별
-실제 피복률을 검사하며, IDW 조건을 만족하지 못한 수음점이 하나라도 있으면 저장을
-중단합니다.
+파이프라인 시작 전 건물과 토지피복도를 EPSG:5179로 변환해 계산 영역 전체를
+포함하는지 검사합니다. 등고선은 해안 밖 바다에는 존재하지 않으므로 사각형 외곽
+`max_search_radius_m` 전체에 대한 BBOX 검사는 적용하지 않습니다. 대신 해양수
+수음점을 제외한 뒤 각 육지 수음점에서 실제 IDW 입력 조건을 검사하며, 조건을
+만족하지 못한 육지 수음점이 하나라도 있으면 저장을 중단합니다. 토지피복도는 지면
+격자별 실제 피복률을 검사합니다.
 
 건물 입력 파일은 존재하지만 계산 영역과 교차하는 건물이 없으면 오류로 중단하지
 않습니다. 건물 데이터셋·버퍼·벽면·지붕 수음점 단계를 로그와 함께 건너뛰고,
@@ -160,6 +171,7 @@ IDW 입력에서 완전히 제외되지 않습니다. 동시에
 ..\.venv\Scripts\python.exe generate_building_wall_buffers.py
 ..\.venv\Scripts\python.exe generate_building_wall_receivers.py
 ..\.venv\Scripts\python.exe generate_building_roof_receivers.py
+..\.venv\Scripts\python.exe extract_coastline.py --overwrite
 ..\.venv\Scripts\python.exe generate_terrain_receivers.py
 ..\.venv\Scripts\python.exe merge_receivers.py
 ```
@@ -173,6 +185,7 @@ IDW 입력에서 완전히 제외되지 않습니다. 동시에
 - `scripts/generate_building_wall_receivers.py`: 벽면 수음점 생성
 - `scripts/generate_building_roof_receivers.py`: 지붕 수음점 생성
   ([상세 생성 로직](docs/roof-receiver-generation.md))
+- `scripts/extract_coastline.py`: 토지피복도에서 고도 0m 해안선 생성
 - `scripts/generate_terrain_receivers.py`: 등고선 IDW 및 건물 폴리곤 마스킹 기반 지면 수음점 및 지면계수 생성
 - `scripts/merge_receivers.py`: 수음점 필터링, 정렬, ID 부여 및 병합
 

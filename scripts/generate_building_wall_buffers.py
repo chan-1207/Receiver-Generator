@@ -8,7 +8,9 @@ try:
     from scripts.pipeline_common import (
         get_env_int,
         get_env_path,
-        parallel_map_ordered,
+        process_map_ordered,
+        prepare_temporary_output,
+        replace_temporary_output,
         validate_input_paths,
         validate_positive,
     )
@@ -16,7 +18,9 @@ except ModuleNotFoundError:
     from pipeline_common import (
         get_env_int,
         get_env_path,
-        parallel_map_ordered,
+        process_map_ordered,
+        prepare_temporary_output,
+        replace_temporary_output,
         validate_input_paths,
         validate_positive,
     )
@@ -49,7 +53,7 @@ keep_cols = [
 
 receiver_offset_m = 1.0     # 최종 수음점용 외곽 버퍼 [m]
 
-parallel_workers = get_env_int("PARALLEL_WORKERS", 8)
+process_workers = get_env_int("PROCESS_WORKERS", 8)
 building_chunk_size = get_env_int("BUILDING_CHUNK_SIZE", 250)
 
 
@@ -97,7 +101,7 @@ def make_receiver_buffer(geom):
 
 
 def main():
-    validate_positive(parallel_workers, "공통 병렬 작업 수")
+    validate_positive(process_workers, "프로세스 작업 수")
     validate_positive(building_chunk_size, "건물 묶음 크기")
     validate_input_paths([input_building_metadata_path])
 
@@ -135,13 +139,13 @@ def main():
     gdf = simplified_gdf[keep_cols + ["geometry"]].copy()
 
     print("[2] 수음점용 외곽 버퍼 처리 시작")
-    print(" - parallel workers:", parallel_workers)
+    print(" - process workers:", process_workers)
     print(" - maximum chunk size:", building_chunk_size)
     buffer_gdf = gdf.copy()
-    buffer_gdf["geometry"] = parallel_map_ordered(
+    buffer_gdf["geometry"] = process_map_ordered(
         make_receiver_buffer,
         buffer_gdf.geometry,
-        parallel_workers,
+        process_workers,
         building_chunk_size,
     )
     buffer_gdf = buffer_gdf[
@@ -151,15 +155,20 @@ def main():
         ~buffer_gdf.geometry.is_empty
     ].copy()
 
-    if output_gpkg_path.exists():
-        output_gpkg_path.unlink()
-
+    temporary_output_path = prepare_temporary_output(output_gpkg_path)
     buffer_gdf.to_file(
-        output_gpkg_path,
+        temporary_output_path,
         driver="GPKG",
         layer=output_layer_name,
         index=False,
     )
+    written_layers = set(gpd.list_layers(temporary_output_path)["name"])
+    if written_layers != {output_layer_name}:
+        raise ValueError(
+            "GeoPackage 레이어 저장 결과가 올바르지 않음: "
+            f"{sorted(written_layers)}"
+        )
+    replace_temporary_output(temporary_output_path, output_gpkg_path)
     print("[3] 저장 완료")
     print(" - output:", output_gpkg_path)
     print(" - buffer layer:", output_layer_name)

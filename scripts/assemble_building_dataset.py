@@ -11,22 +11,28 @@ try:
         get_env_float,
         get_env_int,
         get_env_path,
-        parallel_map_ordered,
+        process_map_ordered,
+        prepare_temporary_output,
+        replace_temporary_output,
         validate_bounds,
         validate_input_paths,
         validate_positive,
         validate_spatial_file_coverage,
+        write_csv_atomically,
     )
 except ModuleNotFoundError:
     from pipeline_common import (
         get_env_float,
         get_env_int,
         get_env_path,
-        parallel_map_ordered,
+        process_map_ordered,
+        prepare_temporary_output,
+        replace_temporary_output,
         validate_bounds,
         validate_input_paths,
         validate_positive,
         validate_spatial_file_coverage,
+        write_csv_atomically,
     )
 
 
@@ -60,7 +66,7 @@ closing_distance_m = 10.0
 simplify_tolerance_m = 1.0
 mrr_padding_m = 0.001
 min_area_m2 = 25.0
-parallel_workers = get_env_int("PARALLEL_WORKERS", 8)
+process_workers = get_env_int("PROCESS_WORKERS", 8)
 building_chunk_size = get_env_int("BUILDING_CHUNK_SIZE", 250)
 
 # =========================================================
@@ -188,7 +194,7 @@ def make_minimum_rotated_rectangle(geom):
 
 def main():
     validate_bounds(min_x, max_x, min_y, max_y)
-    validate_positive(parallel_workers, "공통 병렬 작업 수")
+    validate_positive(process_workers, "프로세스 작업 수")
     validate_positive(building_chunk_size, "건물 묶음 크기")
     validate_input_paths([
         input_building_height_gpkg_path,
@@ -280,12 +286,12 @@ def main():
         duplicate_ids = bld.loc[duplicate_id_mask, "NF_ID"].head(5).tolist()
         raise ValueError(f"중복 NF_ID가 있음: {duplicate_ids}")
 
-    print(" - parallel workers:", parallel_workers)
+    print(" - process workers:", process_workers)
     print(" - maximum chunk size:", building_chunk_size)
-    bld["geometry"] = parallel_map_ordered(
+    bld["geometry"] = process_map_ordered(
         to_multipolygon,
         bld.geometry,
-        parallel_workers,
+        process_workers,
         building_chunk_size,
     )
     invalid_geometry_mask = (
@@ -322,10 +328,10 @@ def main():
 
     # 공통 단순화 형상과 전파 계산 속성 생성
     simplified_gdf = meta_final.copy()
-    simplified_gdf["geometry"] = parallel_map_ordered(
+    simplified_gdf["geometry"] = process_map_ordered(
         simplify_building_polygon,
         simplified_gdf.geometry,
-        parallel_workers,
+        process_workers,
         building_chunk_size,
     )
     simplified_invalid_mask = (
@@ -343,10 +349,10 @@ def main():
 
     # 최소면적 회전사각형 생성
     mrr_gdf = simplified_gdf[["NF_ID", "geometry"]].copy()
-    mrr_gdf["geometry"] = parallel_map_ordered(
+    mrr_gdf["geometry"] = process_map_ordered(
         make_minimum_rotated_rectangle,
         mrr_gdf.geometry,
-        parallel_workers,
+        process_workers,
         building_chunk_size,
     )
     mrr_invalid_mask = (
@@ -387,12 +393,7 @@ def main():
     # =========================================================
     print("[4] 저장")
 
-    temporary_output_gpkg_path = output_gpkg_path.with_name(
-        f"{output_gpkg_path.stem}.tmp{output_gpkg_path.suffix}"
-    )
-
-    if temporary_output_gpkg_path.exists():
-        temporary_output_gpkg_path.unlink()
+    temporary_output_gpkg_path = prepare_temporary_output(output_gpkg_path)
 
     simplified_gdf.to_file(
         temporary_output_gpkg_path,
@@ -419,9 +420,10 @@ def main():
             f"{sorted(written_layers)}"
         )
 
-    temporary_output_gpkg_path.replace(output_gpkg_path)
+    replace_temporary_output(temporary_output_gpkg_path, output_gpkg_path)
 
-    meta_final.drop(columns="geometry").to_csv(
+    write_csv_atomically(
+        meta_final.drop(columns="geometry"),
         output_csv_path,
         index=False,
         encoding="utf-8-sig",
