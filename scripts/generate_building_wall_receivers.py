@@ -5,9 +5,8 @@ import geopandas as gpd
 import pandas as pd
 import numpy as np
 import shapely
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString
 from shapely.strtree import STRtree
-from shapely.validation import make_valid
 from pyproj import Transformer
 
 try:
@@ -73,18 +72,6 @@ building_chunk_size = get_env_int("BUILDING_CHUNK_SIZE", 250)
 # =========================
 # 보조 함수
 # =========================
-def clean_geom(geom):
-    if geom is None or geom.is_empty:
-        return None
-
-    geom = make_valid(geom)
-
-    if geom is None or geom.is_empty:
-        return None
-
-    return geom
-
-
 def polygon_parts(geom):
     if geom is None or geom.is_empty:
         return []
@@ -324,7 +311,7 @@ def main():
     # 데이터 정리
     # =========================
     buf = buf[buf.geometry.notnull()].copy()
-    buf["geometry"] = buf.geometry.apply(clean_geom)
+    buf["geometry"] = shapely.make_valid(buf.geometry.to_numpy())
     buf = buf[buf.geometry.notnull()].copy()
     buf = buf[~buf.geometry.is_empty].copy()
 

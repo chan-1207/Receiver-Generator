@@ -91,7 +91,7 @@ building_layer_name = "building_simplified"
 building_base_elevation_field = "BLDH_MN"
 has_buildings = get_env_bool("RECEIVER_HAS_BUILDINGS", True)
 
-parallel_workers = get_env_int("PARALLEL_WORKERS", 8)
+thread_workers = get_env_int("THREAD_WORKERS", 8)
 ground_factor_chunk_size = get_env_int(
     "GROUND_FACTOR_CHUNK_SIZE",
     20_000,
@@ -563,15 +563,15 @@ def iterate_ground_factor_chunks(
             land_factors,
         )
 
-    if parallel_workers == 1:
+    if thread_workers == 1:
         for chunk_range in chunk_ranges:
             yield calculate(chunk_range)
         return
 
     chunk_iterator = iter(chunk_ranges)
-    with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+    with ThreadPoolExecutor(max_workers=thread_workers) as executor:
         pending = {}
-        for _ in range(min(parallel_workers, len(chunk_ranges))):
+        for _ in range(min(thread_workers, len(chunk_ranges))):
             chunk_range = next(chunk_iterator)
             pending[executor.submit(calculate, chunk_range)] = chunk_range
 
@@ -654,7 +654,7 @@ def assign_ground_factor(grid_df):
     grid_y = grid_df["y_epsg5179"].to_numpy(dtype=float)
     effective_chunk_size = min(
         ground_factor_chunk_size,
-        max(1, math.ceil(len(grid_df) / parallel_workers)),
+        max(1, math.ceil(len(grid_df) / thread_workers)),
     )
     chunk_ranges = [
         (
@@ -675,7 +675,7 @@ def assign_ground_factor(grid_df):
     print("[지면계수 공간계산]")
     print(" - cell count:", len(grid_df))
     print(" - land cover polygons:", len(land_cover))
-    print(" - workers:", parallel_workers)
+    print(" - thread workers:", thread_workers)
     print(" - chunk size:", effective_chunk_size)
 
     chunk_results = iterate_ground_factor_chunks(
@@ -1304,15 +1304,15 @@ def iterate_contour_idw_chunks(
             building_elevations,
         )
 
-    if parallel_workers == 1:
+    if thread_workers == 1:
         for chunk_range in chunk_ranges:
             yield calculate(chunk_range)
         return
 
     chunk_iterator = iter(chunk_ranges)
-    with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+    with ThreadPoolExecutor(max_workers=thread_workers) as executor:
         pending = {}
-        for _ in range(min(parallel_workers, len(chunk_ranges))):
+        for _ in range(min(thread_workers, len(chunk_ranges))):
             chunk_range = next(chunk_iterator)
             pending[executor.submit(calculate, chunk_range)] = chunk_range
 
@@ -1354,7 +1354,7 @@ def calculate_contour_idw_ground_z(
     ground_z = np.full(len(grid_df), np.nan, dtype=float)
     effective_chunk_size = min(
         contour_distance_chunk_size,
-        max(1, math.ceil(len(grid_df) / parallel_workers)),
+        max(1, math.ceil(len(grid_df) / thread_workers)),
     )
     chunk_ranges = [
         (
@@ -1392,7 +1392,7 @@ def calculate_contour_idw_ground_z(
     print(" - maximum contours:", idw_max_contours)
     print(" - minimum elevation levels:", idw_min_elevation_levels)
     print(" - power:", IDW_POWER)
-    print(" - workers:", parallel_workers)
+    print(" - thread workers:", thread_workers)
     print(" - chunk size:", effective_chunk_size)
 
     chunk_results = iterate_contour_idw_chunks(
@@ -1497,9 +1497,7 @@ def read_building_mask():
     if buildings.empty:
         raise ValueError("마스킹에 사용할 유효한 건물 폴리곤이 없습니다.")
 
-    building_union = shapely.union_all(buildings.geometry.to_numpy())
-    if building_union.is_empty:
-        raise ValueError("건물 폴리곤 마스크를 생성하지 못했습니다.")
+    mask_geometries = buildings.geometry.to_numpy()
 
     if building_base_elevation_field not in buildings.columns:
         raise ValueError(
@@ -1528,12 +1526,12 @@ def read_building_mask():
         building_elevations.min(),
         building_elevations.max(),
     )
-    return building_union, building_geometries, building_elevations
+    return mask_geometries, building_geometries, building_elevations
 
 
-def mask_grid_by_buildings(grid_df, building_union):
+def mask_grid_by_buildings(grid_df, mask_geometries):
     """건물 폴리곤 내부 또는 경계의 격자 중심점을 병렬 제거한다."""
-    if building_union is None:
+    if mask_geometries is None or len(mask_geometries) == 0:
         print("[IDW 건물 폴리곤 마스킹]")
         print(" - removed: 0")
         print(" - remaining:", len(grid_df))
@@ -1546,7 +1544,7 @@ def mask_grid_by_buildings(grid_df, building_union):
         10_000,
         min(
             100_000,
-            math.ceil(point_count / max(1, parallel_workers * 4)),
+            math.ceil(point_count / max(1, thread_workers * 4)),
         ),
     )
     chunk_ranges = [
@@ -1554,22 +1552,27 @@ def mask_grid_by_buildings(grid_df, building_union):
         for start in range(0, point_count, effective_chunk_size)
     ]
     inside_or_boundary = np.zeros(point_count, dtype=bool)
-
-    # 반복되는 covers 연산에서 공간 인덱스를 재사용한다.
-    shapely.prepare(building_union)
+    building_tree = STRtree(mask_geometries)
 
     def calculate(chunk_range):
         start, end = chunk_range
         points = shapely.points(grid_x[start:end], grid_y[start:end])
-        return start, end, shapely.covers(building_union, points)
+        candidate_pairs = building_tree.query(
+            points,
+            predicate="intersects",
+        )
+        chunk_mask = np.zeros(end - start, dtype=bool)
+        if candidate_pairs.shape[1] > 0:
+            chunk_mask[candidate_pairs[0]] = True
+        return start, end, chunk_mask
 
     print("[IDW 건물 폴리곤 마스킹]")
     print(" - before:", point_count)
-    print(" - workers:", parallel_workers)
+    print(" - thread workers:", thread_workers)
     print(" - chunk size:", effective_chunk_size)
     print(" - chunks:", len(chunk_ranges))
 
-    if parallel_workers == 1 or len(chunk_ranges) == 1:
+    if thread_workers == 1 or len(chunk_ranges) == 1:
         for completed_count, chunk_range in enumerate(chunk_ranges, start=1):
             start, end, chunk_mask = calculate(chunk_range)
             inside_or_boundary[start:end] = chunk_mask
@@ -1580,9 +1583,9 @@ def mask_grid_by_buildings(grid_df, building_union):
     else:
         completed_points = 0
         chunk_iterator = iter(chunk_ranges)
-        with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+        with ThreadPoolExecutor(max_workers=thread_workers) as executor:
             pending = {}
-            for _ in range(min(parallel_workers, len(chunk_ranges))):
+            for _ in range(min(thread_workers, len(chunk_ranges))):
                 chunk_range = next(chunk_iterator)
                 pending[executor.submit(calculate, chunk_range)] = chunk_range
 
@@ -1624,11 +1627,11 @@ def mask_grid_by_buildings(grid_df, building_union):
 
 def make_terrain_receivers():
     (
-        building_union,
+        mask_geometries,
         building_geometries,
         building_elevations,
     ) = read_building_mask()
-    grid_df = mask_grid_by_buildings(make_grid(), building_union)
+    grid_df = mask_grid_by_buildings(make_grid(), mask_geometries)
     grid_df = assign_ground_factor(grid_df)
     marine_mask = grid_df["_is_marine_water"].to_numpy(dtype=bool)
     grid_df = grid_df.loc[~marine_mask].reset_index(drop=True)
@@ -1660,7 +1663,7 @@ def make_terrain_receivers():
 def main():
     validate_bounds(min_x, max_x, min_y, max_y)
     validate_positive(grid_m, "지면 수음점 해상도")
-    validate_positive(parallel_workers, "공통 병렬 작업 수")
+    validate_positive(thread_workers, "스레드 작업 수")
     validate_positive(ground_factor_chunk_size, "지면계수 묶음 크기")
     validate_positive(idw_search_radius_m, "IDW 기준 탐색 반경")
     validate_positive(idw_max_search_radius_m, "IDW 최대 탐색 반경")

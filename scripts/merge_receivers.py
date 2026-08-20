@@ -1,16 +1,19 @@
 from pathlib import Path
+import math
 
 import numpy as np
 import pandas as pd
 import geopandas as gpd
-
-from shapely.geometry import Point
+import shapely
+from shapely.strtree import STRtree
 
 try:
     from scripts.pipeline_common import (
         get_env_bool,
         get_env_float,
+        get_env_int,
         get_env_path,
+        parallel_map_ordered,
         validate_bounds,
         validate_input_paths,
         validate_positive,
@@ -20,7 +23,9 @@ except ModuleNotFoundError:
     from pipeline_common import (
         get_env_bool,
         get_env_float,
+        get_env_int,
         get_env_path,
+        parallel_map_ordered,
         validate_bounds,
         validate_input_paths,
         validate_positive,
@@ -68,6 +73,7 @@ max_x = get_env_float("RECEIVER_MAX_X", 1164000)
 min_y = get_env_float("RECEIVER_MIN_Y", 1732000)
 max_y = get_env_float("RECEIVER_MAX_Y", 1733000)
 has_buildings = get_env_bool("RECEIVER_HAS_BUILDINGS", True)
+thread_workers = get_env_int("THREAD_WORKERS", 8)
 
 
 # =========================
@@ -178,27 +184,9 @@ def validate_receiver_bounds(df, receiver_type):
 
 
 # =========================
-# GeoDataFrame 변환 함수
-# =========================
-def to_point_gdf(df):
-    geom = [
-        Point(x, y)
-        for x, y in zip(df["x_epsg5179"], df["y_epsg5179"])
-    ]
-
-    return gpd.GeoDataFrame(
-        df.copy(),
-        geometry=geom,
-        crs=crs_epsg
-    )
-
-
-# =========================
 # 지면 수음점 필터링 함수
 # =========================
 def remove_terrain_points_inside_building_buffer(terrain_df):
-    terrain_gdf = to_point_gdf(terrain_df)
-
     if buffer_layer_name is None:
         buffer_gdf = gpd.read_file(building_buffer_gpkg_path)
     else:
@@ -216,23 +204,54 @@ def remove_terrain_points_inside_building_buffer(terrain_df):
     buffer_gdf = buffer_gdf[buffer_gdf.geometry.notnull()].copy()
     buffer_gdf = buffer_gdf[~buffer_gdf.geometry.is_empty].copy()
 
-    # 버퍼 내부·경계 수음점 제거
-    joined = gpd.sjoin(
-        terrain_gdf,
-        buffer_gdf[["geometry"]],
-        how="left",
-        predicate="intersects"
+    point_count = len(terrain_df)
+    terrain_points = shapely.points(
+        terrain_df["x_epsg5179"].to_numpy(dtype=float),
+        terrain_df["y_epsg5179"].to_numpy(dtype=float),
     )
+    buffer_tree = STRtree(buffer_gdf.geometry.to_numpy())
+    effective_chunk_size = max(
+        10_000,
+        min(
+            100_000,
+            math.ceil(point_count / max(1, thread_workers * 4)),
+        ),
+    )
+    chunk_ranges = [
+        (start, min(start + effective_chunk_size, point_count))
+        for start in range(0, point_count, effective_chunk_size)
+    ]
 
-    filtered = joined[joined["index_right"].isna()].copy()
-    filtered = filtered.drop(columns=["index_right", "geometry"], errors="ignore")
+    def calculate(chunk_range):
+        start, end = chunk_range
+        pairs = buffer_tree.query(
+            terrain_points[start:end],
+            predicate="intersects",
+        )
+        chunk_mask = np.zeros(end - start, dtype=bool)
+        if pairs.shape[1] > 0:
+            chunk_mask[pairs[0]] = True
+        return start, chunk_mask
+
+    inside_or_boundary = np.zeros(point_count, dtype=bool)
+    for start, chunk_mask in parallel_map_ordered(
+        calculate,
+        chunk_ranges,
+        thread_workers,
+        1,
+    ):
+        inside_or_boundary[start:start + len(chunk_mask)] = chunk_mask
+
+    filtered = terrain_df.loc[~inside_or_boundary].copy()
 
     print("[지면 수음점 필터링]")
     print(" - before:", len(terrain_df))
     print(" - removed:", len(terrain_df) - len(filtered))
     print(" - after:", len(filtered))
+    print(" - thread workers:", thread_workers)
+    print(" - chunk size:", effective_chunk_size)
 
-    return pd.DataFrame(filtered)
+    return filtered
 
 
 # =========================
@@ -381,6 +400,7 @@ def main():
     validate_bounds(min_x, max_x, min_y, max_y)
     validate_positive(grid_size_m, "격자 크기")
     validate_positive(cell_size_m, "수음점 해상도")
+    validate_positive(thread_workers, "스레드 작업 수")
     required_input_paths = [terrain_receiver_csv_path]
     if has_buildings:
         required_input_paths.extend([

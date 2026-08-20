@@ -36,7 +36,8 @@
     "grid_size_m": 100.0
   },
   "parallel_processing": {
-    "workers": 8,
+    "process_workers": 8,
+    "thread_workers": 8,
     "building_chunk_size": 250,
     "ground_factor_chunk_size": 20000,
     "terrain_chunk_size": 2000
@@ -99,7 +100,8 @@
 |  | `max_y` | EPSG:5179 Y 최댓값 | 필수 |
 | **`grid`** | `resolution_m` | 지면 및 건물 수음점 간격 | 10m |
 |  | `grid_size_m` | 병합 결과의 격자 ID 크기 | 100m |
-| **`parallel_processing`** | `workers` | 모든 병렬 계산의 공통 작업 수 | 8 |
+| **`parallel_processing`** | `process_workers` | 건물별 독립 CPU 계산의 프로세스 수 | 8 |
+|  | `thread_workers` | 공유 공간 인덱스·대형 배열 계산의 스레드 수 | 8 |
 |  | `building_chunk_size` | 작업당 최대 건물 수 | 250 |
 |  | `ground_factor_chunk_size` | 작업당 최대 지면 셀 수 | 20,000 |
 |  | `terrain_chunk_size` | 작업당 최대 IDW 보간 수음점 수 | 2,000 |
@@ -141,9 +143,16 @@ IDW 입력에서 완전히 제외되지 않습니다. 동시에
 건물 폴리곤 내부 또는 경계에 놓인 지면 격자 중심점을 제거하고, 최종 병합 단계에서
 기존 1m 건물 버퍼 내부의 지면 수음점을 추가로 제거합니다. 보간 후 건물에 맞춰
 주변 지형고를 다시 자르는 사후 보정은 적용하지 않습니다.
-건물 마스킹은 전체 지면 격자를 제한된 크기의 묶음으로 나누어
-`parallel_processing.workers`만큼 병렬 처리하며, 위경도 변환은 건물과 해양수
-격자를 제거한 최종 육지 수음점에만 수행합니다.
+건물 마스킹은 건물 폴리곤 공간 인덱스를 한 번 생성한 뒤 전체 지면 격자를 제한된
+크기의 묶음으로 나누어 `parallel_processing.thread_workers`만큼 병렬 처리합니다.
+건물별 형상 정리, 버퍼, 벽면 및 지붕 수음점 생성은
+`parallel_processing.process_workers`개의 프로세스로 처리합니다. 벽면·지붕의
+위경도 변환은 후보 생성과 필터링이 끝난 뒤 배열 단위로 한 번에 수행합니다.
+
+이 구분은 Windows에서 대형 격자와 공간 인덱스가 프로세스마다 복제되는 것을
+피하면서, Python 반복이 많은 건물별 계산에는 GIL의 영향을 받지 않는 프로세스를
+사용하기 위한 것입니다. 이전 설정의 `workers`만 있는 구성도 읽을 수 있으며,
+그 값은 두 작업 수의 호환 기본값으로 사용됩니다.
 
 `input_files`의 경로는 프로젝트 루트 기준 상대경로 또는 절대경로로
 설정할 수 있습니다. `main.py`가 건물 메타데이터, 건물 버퍼, 벽면·지붕·지면

@@ -4,6 +4,7 @@ from pathlib import Path
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import shapely
 from pyproj import Transformer
 from shapely.affinity import rotate
 from shapely.geometry import LineString, Point, box
@@ -15,7 +16,7 @@ try:
         get_env_float,
         get_env_int,
         get_env_path,
-        parallel_map_ordered,
+        process_map_ordered,
         validate_bounds,
         validate_input_paths,
         validate_positive,
@@ -26,7 +27,7 @@ except ModuleNotFoundError:
         get_env_float,
         get_env_int,
         get_env_path,
-        parallel_map_ordered,
+        process_map_ordered,
         validate_bounds,
         validate_input_paths,
         validate_positive,
@@ -64,7 +65,7 @@ max_y = get_env_float("RECEIVER_MAX_Y", 1733000)
 rectangularity_threshold = 0.95
 max_split_depth = 5
 min_piece_area_m2 = 15.0
-parallel_workers = get_env_int("PARALLEL_WORKERS", 8)
+process_workers = get_env_int("PROCESS_WORKERS", 8)
 building_chunk_size = get_env_int("BUILDING_CHUNK_SIZE", 250)
 
 
@@ -815,7 +816,9 @@ def load_buildings():
         )
 
     buildings = buildings[buildings.geometry.notnull()].copy()
-    buildings["geometry"] = buildings.geometry.apply(clean_geom)
+    buildings["geometry"] = shapely.make_valid(
+        buildings.geometry.to_numpy()
+    )
     buildings = buildings[buildings.geometry.notnull()].copy()
     buildings = buildings[~buildings.geometry.is_empty].copy()
 
@@ -844,7 +847,7 @@ def load_buildings():
     return buildings
 
 
-def make_roof_receiver_records(building_data, transformer):
+def make_roof_receiver_records(building_data):
     """단일 건물의 지붕 수음점과 통계 반환"""
     building_id, roof_top, geom = building_data
     records = []
@@ -860,30 +863,22 @@ def make_roof_receiver_records(building_data, transformer):
         if not (min_x <= x <= max_x and min_y <= y <= max_y):
             continue
 
-        lon, lat = transformer.transform(x, y)
-        records.append({
-            "building_id": building_id,
-            "x_epsg5179": x,
-            "y_epsg5179": y,
-            "lat": lat,
-            "lon": lon,
-            "alt": roof_alt,
-        })
+        records.append((building_id, x, y, roof_alt))
 
     return records, center_count, grid_count, split_count, piece_count
 
 
 def generate_receivers(buildings, transformer):
     """전체 지붕 수음점 생성 및 CSV 저장"""
-    print("parallel workers:", parallel_workers)
+    print("process workers:", process_workers)
     print("maximum building chunk size:", building_chunk_size)
     building_values = buildings[
         [id_col, top_col, "geometry"]
     ].itertuples(index=False, name=None)
-    building_results = parallel_map_ordered(
-        lambda value: make_roof_receiver_records(value, transformer),
+    building_results = process_map_ordered(
+        make_roof_receiver_records,
         building_values,
-        parallel_workers,
+        process_workers,
         building_chunk_size,
     )
     records = [
@@ -899,6 +894,19 @@ def generate_receivers(buildings, transformer):
     if len(records) == 0:
         raise ValueError("생성된 지붕 수음점이 없습니다.")
 
+    projected_cols = [
+        "building_id",
+        "x_epsg5179",
+        "y_epsg5179",
+        "alt",
+    ]
+    output_df = pd.DataFrame(records, columns=projected_cols)
+    lon, lat = transformer.transform(
+        output_df["x_epsg5179"].to_numpy(dtype=float),
+        output_df["y_epsg5179"].to_numpy(dtype=float),
+    )
+    output_df["lat"] = lat
+    output_df["lon"] = lon
     output_cols = [
         "building_id",
         "x_epsg5179",
@@ -907,7 +915,7 @@ def generate_receivers(buildings, transformer):
         "lon",
         "alt",
     ]
-    output_df = pd.DataFrame(records, columns=output_cols)
+    output_df = output_df[output_cols]
     write_csv_atomically(
         output_df,
         output_csv_path,
@@ -930,7 +938,7 @@ def generate_receivers(buildings, transformer):
 def main():
     validate_bounds(min_x, max_x, min_y, max_y)
     validate_positive(roof_resolution_m, "지붕 수음점 해상도")
-    validate_positive(parallel_workers, "공통 병렬 작업 수")
+    validate_positive(process_workers, "프로세스 작업 수")
     validate_positive(building_chunk_size, "건물 묶음 크기")
     validate_input_paths([
         input_building_metadata_gpkg_path,
